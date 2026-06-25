@@ -1,0 +1,16 @@
+# Środowisko / Dane poufne (TOKENY, HASŁA - BARDZO WAŻNE!)
+.env
+
+# Zależności npm
+node_modules/
+
+# Lokalne bazy danych (SQLite fallback)
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Pliki systemowe i logi
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
