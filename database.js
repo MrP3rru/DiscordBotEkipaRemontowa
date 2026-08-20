@@ -27,14 +27,11 @@ function getWarsawDateString(timestamp = Date.now()) {
  */
 function getCurrentWeekRange() {
   const now = new Date();
-  // Pobieramy aktualną datę w Warszawie
   const warsawStr = getWarsawDateString(now.getTime());
   const [year, month, day] = warsawStr.split('-').map(Number);
   
   const currentWarsawDate = new Date(Date.UTC(year, month - 1, day));
-  // getUTCDay: 0 = niedziela, 1 = poniedziałek, ..., 6 = sobota
   const dayOfWeek = currentWarsawDate.getUTCDay();
-  // Obliczamy ile dni odjąć, aby trafić na poniedziałek (poniedziałek = 1, niedziela = 7)
   const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
   
   const monday = new Date(currentWarsawDate);
@@ -80,21 +77,14 @@ function splitSessionByDays(startMs, endMs) {
 
   while (currentStart < endMs) {
     const dateStr = getWarsawDateString(currentStart);
-    // Wyznaczamy początek następnego dnia w strefie polskiej
     const [y, m, d] = dateStr.split('-').map(Number);
-    // Kolejny dzień o 00:00:00 (w przybliżeniu w UTC + strefa)
-    // Bezpieczne podejście: sprawdzamy co 1 godzinę lub wyznaczamy północ
     const nextDayDate = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0));
-    // Przeliczamy północ w strefie polskiej na timestamp
-    // Różnica w czasie w Polsce to UTC+1 (zima) lub UTC+2 (lato)
-    // Sprawdzamy kiedy zmieni się data getWarsawDateString
-    let nextMidnightMs = nextDayDate.getTime() - (2 * 60 * 60 * 1000); // próba CEST
+    
+    let nextMidnightMs = nextDayDate.getTime() - (2 * 60 * 60 * 1000);
     if (getWarsawDateString(nextMidnightMs) !== dateStr) {
-      // Dostosowanie w razie CET (UTC+1)
       nextMidnightMs = nextDayDate.getTime() - (1 * 60 * 60 * 1000);
     }
     
-    // Jeśli nie wyliczono idealnie, bierzemy koniec sesji lub następny krok
     const chunkEnd = (nextMidnightMs > currentStart && nextMidnightMs < endMs) ? nextMidnightMs : endMs;
     const duration = chunkEnd - currentStart;
 
@@ -112,82 +102,42 @@ function splitSessionByDays(startMs, endMs) {
 }
 
 /**
+ * Bezpieczne wykonywanie zapytań do PostgreSQL z automatycznym ponawianiem w razie zerwania połączenia / idle timeout (57P01).
+ */
+async function queryPg(text, params = []) {
+  if (!pgPool) throw new Error('Brak aktywnego połączenia z PostgreSQL');
+  try {
+    return await pgPool.query(text, params);
+  } catch (error) {
+    // Kod 57P01: terminating connection due to administrator command (np. restart / timeout Supabase poolera)
+    // Kod 57P03: cannot_connect_now
+    // ECONNRESET / Connection terminated
+    const isTransientError = error.code === '57P01' || 
+                             error.code === '57P03' || 
+                             error.code === '08006' ||
+                             (error.message && (
+                               error.message.includes('terminating connection') ||
+                               error.message.includes('Connection terminated') ||
+                               error.message.includes('socket hang up') ||
+                               error.message.includes('ECONNRESET')
+                             ));
+
+    if (isTransientError) {
+      console.warn('⚠️ [PostgreSQL Pool] Nastąpiło zerwanie połączenia przez serwer. Ponawiam zapytanie...');
+      await new Promise(res => setTimeout(res, 200));
+      return await pgPool.query(text, params);
+    }
+    throw error;
+  }
+}
+
+/**
  * Inicjalizuje połączenie z bazą danych (PostgreSQL lub SQLite).
  */
 async function initDatabase() {
   const connectionString = process.env.DATABASE_URL;
 
-  if (connectionString && connectionString !== 'twój_connection_string_supabase_tutaj') {
-    console.log('Wykryto DATABASE_URL. Próba połączenia z PostgreSQL (Supabase)...');
-    try {
-      pgPool = new Pool({
-        connectionString: connectionString,
-        ssl: {
-          rejectUnauthorized: false
-        },
-        connectionTimeoutMillis: 5000
-      });
-
-      const client = await pgPool.connect();
-      try {
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS active_sessions (
-            user_id VARCHAR(30) PRIMARY KEY,
-            guild_id VARCHAR(30) NOT NULL,
-            join_time BIGINT NOT NULL,
-            channel_id VARCHAR(30)
-          )
-        `);
-
-        // Sprawdzamy czy kolumna channel_id istnieje (dla istniejących baz)
-        try {
-          await client.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel_id VARCHAR(30)`);
-        } catch (e) {
-          // Ignoruj jeśli już istnieje
-        }
-
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS user_times (
-            user_id VARCHAR(30),
-            guild_id VARCHAR(30),
-            total_time BIGINT DEFAULT 0,
-            PRIMARY KEY (user_id, guild_id)
-          )
-        `);
-
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS user_daily_times (
-            user_id VARCHAR(30) NOT NULL,
-            guild_id VARCHAR(30) NOT NULL,
-            date VARCHAR(10) NOT NULL,
-            time_spent BIGINT DEFAULT 0,
-            PRIMARY KEY (user_id, guild_id, date)
-          )
-        `);
-
-        await client.query(`
-          CREATE TABLE IF NOT EXISTS system_stats (
-            stat_name VARCHAR(50) PRIMARY KEY,
-            stat_value BIGINT DEFAULT 0
-          )
-        `);
-
-        isPostgres = true;
-        console.log('✅ Pomyślnie połączono z bazą PostgreSQL (Supabase) i zaktualizowano tabele.');
-        return;
-      } finally {
-        client.release();
-      }
-    } catch (error) {
-      console.error('❌ Błąd połączenia z PostgreSQL (Supabase):', error.message);
-      console.log('⚠️ Następuje automatyczny powrót do lokalnej bazy danych SQLite, aby bot mógł działać...');
-      isPostgres = false;
-      pgPool = null;
-    }
-  }
-
-  // Fallback do SQLite
-  console.log('Inicjalizacja lokalnej bazy danych SQLite...');
+  // Zawsze inicjalizujemy bazę SQLite jako bazę zapasową / lokalną
   const dbPath = path.join(__dirname, 'database.sqlite');
   try {
     dbSQLite = await open({
@@ -204,7 +154,6 @@ async function initDatabase() {
       )
     `);
 
-    // Sprawdzamy czy kolumna channel_id istnieje w SQLite
     const tableInfo = await dbSQLite.all(`PRAGMA table_info(active_sessions)`);
     const hasChannelCol = tableInfo.some(col => col.name === 'channel_id');
     if (!hasChannelCol) {
@@ -240,11 +189,83 @@ async function initDatabase() {
         stat_value INTEGER DEFAULT 0
       )
     `);
-    console.log('✅ Połączono z lokalną bazą danych SQLite.');
   } catch (error) {
-    console.error('❌ Krytyczny błąd podczas inicjalizacji SQLite:', error);
-    throw error;
+    console.error('❌ Błąd inicjalizacji zapasowej bazy SQLite:', error);
   }
+
+  // Próba połączenia z PostgreSQL (Supabase)
+  if (connectionString && connectionString !== 'twój_connection_string_supabase_tutaj') {
+    console.log('Wykryto DATABASE_URL. Próba połączenia z PostgreSQL (Supabase)...');
+    try {
+      pgPool = new Pool({
+        connectionString: connectionString,
+        ssl: {
+          rejectUnauthorized: false
+        },
+        max: 10,
+        idleTimeoutMillis: 15000,
+        connectionTimeoutMillis: 5000,
+        allowExitOnIdle: false
+      });
+
+      // Obsługa błędów bezczynnego klienta w puli (zapobiega nieobsłużonym błędom Node.js)
+      pgPool.on('error', (err) => {
+        console.warn('⚠️ [PostgreSQL Pool] Ostrzeżenie bezczynnego klienta (zostanie zrestartowany):', err.message);
+      });
+
+      // Test połączenia i migracja tabel
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS active_sessions (
+          user_id VARCHAR(30) PRIMARY KEY,
+          guild_id VARCHAR(30) NOT NULL,
+          join_time BIGINT NOT NULL,
+          channel_id VARCHAR(30)
+        )
+      `);
+
+      try {
+        await queryPg(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel_id VARCHAR(30)`);
+      } catch (e) {
+        // Ignoruj jeśli kolumna już istnieje
+      }
+
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS user_times (
+          user_id VARCHAR(30),
+          guild_id VARCHAR(30),
+          total_time BIGINT DEFAULT 0,
+          PRIMARY KEY (user_id, guild_id)
+        )
+      `);
+
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS user_daily_times (
+          user_id VARCHAR(30) NOT NULL,
+          guild_id VARCHAR(30) NOT NULL,
+          date VARCHAR(10) NOT NULL,
+          time_spent BIGINT DEFAULT 0,
+          PRIMARY KEY (user_id, guild_id, date)
+        )
+      `);
+
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS system_stats (
+          stat_name VARCHAR(50) PRIMARY KEY,
+          stat_value BIGINT DEFAULT 0
+        )
+      `);
+
+      isPostgres = true;
+      console.log('✅ Pomyślnie połączono z bazą PostgreSQL (Supabase) i zaktualizowano tabele.');
+      return;
+    } catch (error) {
+      console.error('❌ Błąd połączenia z PostgreSQL (Supabase):', error.message);
+      console.log('⚠️ Następuje automatyczny powrót do lokalnej bazy danych SQLite, aby bot mógł działać...');
+      isPostgres = false;
+    }
+  }
+
+  console.log('✅ Działanie w trybie lokalnej bazy danych SQLite.');
 }
 
 /**
@@ -254,7 +275,7 @@ async function startVoiceSession(userId, guildId, channelId = null) {
   const now = Date.now();
   try {
     if (isPostgres && pgPool) {
-      await pgPool.query(
+      await queryPg(
         `INSERT INTO active_sessions (user_id, guild_id, join_time, channel_id) 
          VALUES ($1, $2, $3, $4) 
          ON CONFLICT (user_id) 
@@ -280,7 +301,7 @@ async function endVoiceSession(userId, guildId) {
     let session = null;
 
     if (isPostgres && pgPool) {
-      const res = await pgPool.query(
+      const res = await queryPg(
         'SELECT join_time FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
       );
@@ -295,21 +316,19 @@ async function endVoiceSession(userId, guildId) {
     }
 
     if (!session) {
-      return; // Brak aktywnej sesji
+      return;
     }
 
     const now = Date.now();
     const duration = now - session.join_time;
 
-    // Usuń aktywną sesję
     if (isPostgres && pgPool) {
-      await pgPool.query(
+      await queryPg(
         'DELETE FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
       );
 
-      // Zaktualizuj łączny czas
-      await pgPool.query(
+      await queryPg(
         `INSERT INTO user_times (user_id, guild_id, total_time)
          VALUES ($1, $2, $3)
          ON CONFLICT(user_id, guild_id) DO UPDATE SET
@@ -317,10 +336,9 @@ async function endVoiceSession(userId, guildId) {
         [userId, guildId, duration]
       );
 
-      // Zaktualizuj czas dzienny (w podziale na poszczególne dni)
       const dayChunks = splitSessionByDays(session.join_time, now);
       for (const chunk of dayChunks) {
-        await pgPool.query(
+        await queryPg(
           `INSERT INTO user_daily_times (user_id, guild_id, date, time_spent)
            VALUES ($1, $2, $3, $4)
            ON CONFLICT(user_id, guild_id, date) DO UPDATE SET
@@ -334,7 +352,6 @@ async function endVoiceSession(userId, guildId) {
         [userId, guildId]
       );
 
-      // Zaktualizuj łączny czas w SQLite
       await dbSQLite.run(
         `INSERT INTO user_times (user_id, guild_id, total_time)
          VALUES (?, ?, ?)
@@ -343,7 +360,6 @@ async function endVoiceSession(userId, guildId) {
         [userId, guildId, duration, duration]
       );
 
-      // Zaktualizuj czas dzienny w SQLite
       const dayChunks = splitSessionByDays(session.join_time, now);
       for (const chunk of dayChunks) {
         await dbSQLite.run(
@@ -367,7 +383,7 @@ async function endVoiceSession(userId, guildId) {
 async function getActiveSession(userId, guildId) {
   try {
     if (isPostgres && pgPool) {
-      const res = await pgPool.query(
+      const res = await queryPg(
         'SELECT join_time, channel_id FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
       );
@@ -431,14 +447,14 @@ function getActiveSessionBreakdown(activeSession) {
 }
 
 /**
- * Pobiera łączny czas spędzony przez użytkownika w milisekundach (dla kompatybilności wstecznej).
+ * Pobiera łączny czas spędzony przez użytkownika w milisekundach.
  */
 async function getUserTime(userId, guildId) {
   try {
     let totalTime = 0;
 
     if (isPostgres && pgPool) {
-      const resTime = await pgPool.query(
+      const resTime = await queryPg(
         'SELECT total_time FROM user_times WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
       );
@@ -487,21 +503,21 @@ async function getUserPeriodTime(userId, guildId, period = 'all') {
 
     if (isPostgres && pgPool) {
       if (period === 'today') {
-        const res = await pgPool.query(
+        const res = await queryPg(
           'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3',
           [userId, guildId, todayStr]
         );
         queryTime = Number(res.rows[0]?.period_time || 0);
         return queryTime + activeBreakdown.today;
       } else if (period === 'week') {
-        const res = await pgPool.query(
+        const res = await queryPg(
           'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4',
           [userId, guildId, weekRange.startDate, weekRange.endDate]
         );
         queryTime = Number(res.rows[0]?.period_time || 0);
         return queryTime + activeBreakdown.week;
       } else if (period === 'month') {
-        const res = await pgPool.query(
+        const res = await queryPg(
           'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4',
           [userId, guildId, monthRange.startDate, monthRange.endDate]
         );
@@ -556,10 +572,10 @@ async function getUserStats(userId, guildId) {
 
     if (isPostgres && pgPool) {
       const [resTotal, resToday, resWeek, resMonth] = await Promise.all([
-        pgPool.query('SELECT total_time FROM user_times WHERE user_id = $1 AND guild_id = $2', [userId, guildId]),
-        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3', [userId, guildId, todayStr]),
-        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, weekRange.startDate, weekRange.endDate]),
-        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, monthRange.startDate, monthRange.endDate]),
+        queryPg('SELECT total_time FROM user_times WHERE user_id = $1 AND guild_id = $2', [userId, guildId]),
+        queryPg('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3', [userId, guildId, todayStr]),
+        queryPg('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, weekRange.startDate, weekRange.endDate]),
+        queryPg('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, monthRange.startDate, monthRange.endDate]),
       ]);
 
       savedTotal = Number(resTotal.rows[0]?.total_time || 0);
@@ -644,11 +660,11 @@ async function getAllUsersSorted(guildId, period = 'all') {
   const weekRange = getCurrentWeekRange();
   const monthRange = getCurrentMonthRange();
 
-  let map = new Map(); // user_id -> time
+  let map = new Map();
 
   if (isPostgres && pgPool) {
     if (period === 'all') {
-      const res = await pgPool.query('SELECT user_id, total_time as time FROM user_times WHERE guild_id = $1', [guildId]);
+      const res = await queryPg('SELECT user_id, total_time as time FROM user_times WHERE guild_id = $1', [guildId]);
       for (const row of res.rows) {
         map.set(row.user_id, Number(row.time));
       }
@@ -662,7 +678,7 @@ async function getAllUsersSorted(guildId, period = 'all') {
         dateFilter = 'date >= $2 AND date <= $3';
         params = [guildId, monthRange.startDate, monthRange.endDate];
       }
-      const res = await pgPool.query(
+      const res = await queryPg(
         `SELECT user_id, SUM(time_spent) as time FROM user_daily_times WHERE guild_id = $1 AND ${dateFilter} GROUP BY user_id`,
         params
       );
@@ -698,11 +714,15 @@ async function getAllUsersSorted(guildId, period = 'all') {
 
   // Uwzględniamy aktywne sesje na żywo
   let activeSessions = [];
-  if (isPostgres && pgPool) {
-    const res = await pgPool.query('SELECT user_id, join_time FROM active_sessions WHERE guild_id = $1', [guildId]);
-    activeSessions = res.rows;
-  } else if (dbSQLite) {
-    activeSessions = await dbSQLite.all('SELECT user_id, join_time FROM active_sessions WHERE guild_id = ?', [guildId]);
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg('SELECT user_id, join_time FROM active_sessions WHERE guild_id = $1', [guildId]);
+      activeSessions = res.rows;
+    } else if (dbSQLite) {
+      activeSessions = await dbSQLite.all('SELECT user_id, join_time FROM active_sessions WHERE guild_id = ?', [guildId]);
+    }
+  } catch (err) {
+    console.error('Błąd pobierania aktywnych sesji dla rankingu:', err.message);
   }
 
   for (const s of activeSessions) {
@@ -726,17 +746,12 @@ async function getAllUsersSorted(guildId, period = 'all') {
     }
   }
 
-  // Sortowanie malejąco
   list.sort((a, b) => b.total_time - a.total_time);
   return list;
 }
 
 /**
  * Pobiera ranking z paginacją oraz wsparciem dla okresów (all, today, week, month).
- * @param {string} guildId 
- * @param {number} limit Liczba wpisów na stronę (np. 10)
- * @param {number} offset Od którego indeksu (np. 0 dla str. 1, 10 dla str. 2)
- * @param {string} period 'all' | 'today' | 'week' | 'month'
  */
 async function getLeaderboard(guildId, limit = 10, offset = 0, period = 'all') {
   try {
@@ -749,7 +764,7 @@ async function getLeaderboard(guildId, limit = 10, offset = 0, period = 'all') {
       totalPages: Math.max(1, Math.ceil(list.length / limit))
     };
   } catch (error) {
-    console.error('Błąd pobierania rankingu:', error);
+    console.error('Błąd pobierania rankingu:', error.message);
     return { entries: [], totalCount: 0, page: 1, totalPages: 1 };
   }
 }
@@ -760,7 +775,7 @@ async function getLeaderboard(guildId, limit = 10, offset = 0, period = 'all') {
 async function incrementDeletedMessages(count) {
   try {
     if (isPostgres && pgPool) {
-      await pgPool.query(
+      await queryPg(
         `INSERT INTO system_stats (stat_name, stat_value)
          VALUES ('deleted_messages', $1)
          ON CONFLICT (stat_name)
@@ -777,7 +792,7 @@ async function incrementDeletedMessages(count) {
       );
     }
   } catch (error) {
-    console.error('Błąd podczas inkrementacji usuniętych wiadomości:', error);
+    console.error('Błąd podczas inkrementacji usuniętych wiadomości:', error.message);
   }
 }
 
@@ -787,7 +802,7 @@ async function incrementDeletedMessages(count) {
 async function getDeletedMessagesCount() {
   try {
     if (isPostgres && pgPool) {
-      const res = await pgPool.query(
+      const res = await queryPg(
         "SELECT stat_value FROM system_stats WHERE stat_name = 'deleted_messages'"
       );
       return res.rows.length > 0 ? Number(res.rows[0].stat_value) : 0;
@@ -799,7 +814,7 @@ async function getDeletedMessagesCount() {
     }
     return 0;
   } catch (error) {
-    console.error('Błąd pobierania licznika usuniętych wiadomości:', error);
+    console.error('Błąd pobierania licznika usuniętych wiadomości:', error.message);
     return 0;
   }
 }

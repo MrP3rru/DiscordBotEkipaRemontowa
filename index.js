@@ -14,6 +14,14 @@ const {
 } = require('discord.js');
 const db = require('./database');
 
+// Zapobieganie wyłączaniu procesu przez nieobsłużone błędy
+process.on('unhandledRejection', (reason, promise) => {
+  console.warn('⚠️ [Ostrzeżenie] Nieobsłużone odrzucenie Promise:', reason?.message || reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('⚠️ [Ostrzeżenie] Nieobsłużony wyjątek:', error?.message || error);
+});
+
 // --- GLOBALNE ZMIENNE STANU BOTA ---
 const activeClearChannels = new Set();
 let isAutoCleanEnabled = true;
@@ -80,16 +88,6 @@ function formatDurationShort(ms) {
   return `${minutes}m`;
 }
 
-// Generowanie estetycznego paska postępu
-function createProgressBar(value, max, length = 10) {
-  if (max <= 0) return '`[░░░░░░░░░░]` 0%';
-  const percentage = Math.min(100, Math.max(0, Math.round((value / max) * 100)));
-  const filledLength = Math.round((percentage / 100) * length);
-  const emptyLength = length - filledLength;
-  const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
-  return `\`[${bar}]\` **${percentage}%**`;
-}
-
 // Etykieta okresu
 function getPeriodLabel(period) {
   switch (period) {
@@ -125,7 +123,7 @@ async function updatePresence() {
 
     client.user.setActivity(statusText, { type: ActivityType.Custom });
   } catch (error) {
-    console.error('Błąd podczas aktualizowania obecności bota:', error);
+    console.error('Błąd podczas aktualizowania obecności bota:', error.message);
   }
 }
 
@@ -162,10 +160,11 @@ async function updateApplicationBio() {
     const bioText = bioLines.join('\n');
     
     if (client.application) {
-      await client.application.edit({ description: bioText });
+      await client.application.edit({ description: bioText }).catch(() => null);
     }
   } catch (error) {
-    console.error('Błąd podczas aktualizowania opisu bota (O mnie):', error.message);
+    // Cicha obsługa ewentualnego rate limitu Discorda
+    console.warn('Ostrzeżenie podczas aktualizowania opisu bota (O mnie):', error.message);
   }
 }
 
@@ -255,12 +254,6 @@ client.once('ready', async () => {
       console.error('[Diagnostyka] Błąd pobierania danych o serwerze:', err.message);
     }
   }
-
-  // Uruchomienie pętli aktualizujących
-  updatePresence();
-  updateApplicationBio();
-  setInterval(updatePresence, 15000); // co 15 sekund
-  setInterval(updateApplicationBio, 30000); // co 30 sekund
 
   // Definicja komend Slash
   const commands = [
@@ -429,8 +422,14 @@ client.once('ready', async () => {
       console.log('Zarejestrowano komendy Slash globalnie.');
     }
   } catch (error) {
-    console.error('Błąd podczas rejestracji komend Slash:', error);
+    console.error('Błąd podczas rejestracji komend Slash:', error.message);
   }
+
+  // Uruchomienie pętli aktualizujących
+  updatePresence();
+  updateApplicationBio();
+  setInterval(updatePresence, 30000); // co 30 sekund
+  setInterval(updateApplicationBio, 300000); // co 5 minut (bezpiecznie przed rate limitem)
 
   // Uruchomienie pętli automatycznego usuwania wiadomości
   startAutoCleanLoop();
@@ -438,432 +437,444 @@ client.once('ready', async () => {
 
 // --- REJESTROWANIE CZASU NA KANAŁACH GŁOSOWYCH ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  const member = newState.member || oldState.member;
-  if (!member || member.user.bot) return; // Ignorujemy boty
+  try {
+    const member = newState.member || oldState.member;
+    if (!member || member.user.bot) return;
 
-  const userId = member.id;
-  const guildId = newState.guild?.id || oldState.guild?.id;
+    const userId = member.id;
+    const guildId = newState.guild?.id || oldState.guild?.id;
 
-  const joinedChannel = !oldState.channelId && newState.channelId;
-  const leftChannel = oldState.channelId && !newState.channelId;
-  const switchedChannel = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
+    const joinedChannel = !oldState.channelId && newState.channelId;
+    const leftChannel = oldState.channelId && !newState.channelId;
+    const switchedChannel = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
 
-  if (joinedChannel) {
-    // Użytkownik wszedł na kanał głosowy
-    await db.startVoiceSession(userId, guildId, newState.channelId);
-    console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
-  } else if (leftChannel) {
-    // Użytkownik wyszedł z kanału głosowego
-    await db.endVoiceSession(userId, guildId);
-    console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
-  } else if (switchedChannel) {
-    // Użytkownik zmienił kanał
-    await db.endVoiceSession(userId, guildId);
-    await db.startVoiceSession(userId, guildId, newState.channelId);
-    console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
+    if (joinedChannel) {
+      await db.startVoiceSession(userId, guildId, newState.channelId);
+      console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
+    } else if (leftChannel) {
+      await db.endVoiceSession(userId, guildId);
+      console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
+    } else if (switchedChannel) {
+      await db.endVoiceSession(userId, guildId);
+      await db.startVoiceSession(userId, guildId, newState.channelId);
+      console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
+    }
+  } catch (err) {
+    console.error('Błąd w zdarzeniu voiceStateUpdate:', err.message);
   }
 });
 
 // --- OBSŁUGA INTERAKCJI (KOMEND SLASH I PRZYCISKÓW) ---
 client.on('interactionCreate', async (interaction) => {
-  // 1. OBSŁUGA PRZYCISKÓW PAGINACJI LEADERBOARD
-  if (interaction.isButton()) {
-    const { customId, guildId } = interaction;
-    if (customId.startsWith('lb_prev_') || customId.startsWith('lb_next_')) {
-      const parts = customId.split('_'); // ['lb', 'prev'/'next', period, page]
-      const direction = parts[1];
-      const period = parts[2];
-      let currentPage = parseInt(parts[3], 10) || 1;
+  try {
+    // 1. OBSŁUGA PRZYCISKÓW PAGINACJI LEADERBOARD
+    if (interaction.isButton()) {
+      const { customId, guildId } = interaction;
+      if (customId.startsWith('lb_prev_') || customId.startsWith('lb_next_')) {
+        const parts = customId.split('_'); // ['lb', 'prev'/'next', period, page]
+        const direction = parts[1];
+        const period = parts[2];
+        let currentPage = parseInt(parts[3], 10) || 1;
 
-      const newPage = direction === 'prev' ? Math.max(1, currentPage - 1) : currentPage + 1;
-      const view = await buildLeaderboardView(guildId, period, newPage);
+        const newPage = direction === 'prev' ? Math.max(1, currentPage - 1) : currentPage + 1;
+        const view = await buildLeaderboardView(guildId, period, newPage);
 
-      return interaction.update(view);
-    }
-    return;
-  }
-
-  if (!interaction.isChatInputCommand()) return;
-
-  const { commandName, options, guildId, user } = interaction;
-
-  // --- KOMENDA /profile ---
-  if (commandName === 'profile') {
-    await interaction.deferReply();
-
-    const targetUser = options.getUser('uzytkownik') || user;
-    const member = interaction.guild?.members.cache.get(targetUser.id) || await interaction.guild?.members.fetch(targetUser.id).catch(() => null);
-    
-    const stats = await db.getUserStats(targetUser.id, guildId);
-
-    // Formatowanie statusu kanału głosowego
-    let voiceStatus = '⚪ **Status:** Poza kanałem głosowym';
-    if (stats.activeSession) {
-      const channelMention = stats.activeSession.channel_id ? `<#${stats.activeSession.channel_id}>` : 'kanał głosowy';
-      const joinUnix = Math.floor(stats.activeSession.join_time / 1000);
-      voiceStatus = `🟢 **Status:** Na kanale ${channelMention} (od <t:${joinUnix}:R>)`;
+        return await interaction.update(view);
+      }
+      return;
     }
 
-    const formatRank = (r) => (r ? `#${r}` : '-');
+    if (!interaction.isChatInputCommand()) return;
 
-    const embed = new EmbedBuilder()
-      .setColor(member?.displayHexColor && member.displayHexColor !== '#000000' ? member.displayHexColor : '#5865F2')
-      .setAuthor({ 
-        name: `Profil Aktywności: ${targetUser.username}`, 
-        iconURL: targetUser.displayAvatarURL({ dynamic: true }) 
-      })
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true, size: 256 }))
-      .setDescription(
-        `${voiceStatus}\n\n` +
-        `📊 **Statystyki czasu spędzonego na rozmowach:**`
-      )
-      .addFields(
-        {
-          name: '📅 Dzisiaj',
-          value: `⏱️ **${formatDuration(stats.today)}**\n🏆 Pozycja: **${formatRank(stats.ranks.today)}**`,
-          inline: true
-        },
-        {
-          name: '📆 Ten tydzień',
-          value: `⏱️ **${formatDuration(stats.week)}**\n🏆 Pozycja: **${formatRank(stats.ranks.week)}**`,
-          inline: true
-        },
-        {
-          name: '🗓️ Ten miesiąc',
-          value: `⏱️ **${formatDuration(stats.month)}**\n🏆 Pozycja: **${formatRank(stats.ranks.month)}**`,
-          inline: true
-        },
-        {
-          name: '🏆 Łącznie (All-time)',
-          value: `⏱️ **${formatDuration(stats.total)}**\n🥇 Pozycja w rankingu: **${formatRank(stats.ranks.total)}**`,
-          inline: false
-        }
-      )
-      .setFooter({ text: 'Ekipa Remontowa Bot • Strefa czasowa: Europe/Warsaw' })
-      .setTimestamp();
+    const { commandName, options, guildId, user } = interaction;
 
-    if (member?.joinedTimestamp) {
-      const joinedUnix = Math.floor(member.joinedTimestamp / 1000);
-      embed.addFields({
-        name: '🛡️ Informacje o użytkowniku',
-        value: `Dołączył(a) na serwer: <t:${joinedUnix}:D> (<t:${joinedUnix}:R>)`,
-        inline: false
-      });
-    }
+    // --- KOMENDA /profile ---
+    if (commandName === 'profile') {
+      await interaction.deferReply();
 
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  // --- KOMENDA /time ---
-  if (commandName === 'time') {
-    await interaction.deferReply();
-
-    const targetUser = options.getUser('uzytkownik') || user;
-    const period = options.getString('okres') || 'all';
-    
-    if (period === 'all') {
+      const targetUser = options.getUser('uzytkownik') || user;
+      const member = interaction.guild?.members.cache.get(targetUser.id) || await interaction.guild?.members.fetch(targetUser.id).catch(() => null);
+      
       const stats = await db.getUserStats(targetUser.id, guildId);
-      const embed = new EmbedBuilder()
-        .setColor('#43b581')
-        .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
-        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-        .setDescription(
-          `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`\n\n` +
-          `📅 **Dzisiaj:** ${formatDuration(stats.today)}\n` +
-          `📆 **Ten tydzień:** ${formatDuration(stats.week)}\n` +
-          `🗓️ **Ten miesiąc:** ${formatDuration(stats.month)}`
-        )
-        .setFooter({ text: 'Użyj /profile aby zobaczyć pozycję w rankingu.' })
-        .setTimestamp();
 
-      return interaction.editReply({ embeds: [embed] });
-    } else {
-      const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, period);
-      const rank = await db.getUserRank(targetUser.id, guildId, period);
-      const periodLabel = getPeriodLabel(period);
+      let voiceStatus = '⚪ **Status:** Poza kanałem głosowym';
+      if (stats.activeSession) {
+        const channelMention = stats.activeSession.channel_id ? `<#${stats.activeSession.channel_id}>` : 'kanał głosowy';
+        const joinUnix = Math.floor(stats.activeSession.join_time / 1000);
+        voiceStatus = `🟢 **Status:** Na kanale ${channelMention} (od <t:${joinUnix}:R>)`;
+      }
+
+      const formatRank = (r) => (r ? `#${r}` : '-');
 
       const embed = new EmbedBuilder()
-        .setColor('#43b581')
-        .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
-        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setColor(member?.displayHexColor && member.displayHexColor !== '#000000' ? member.displayHexColor : '#5865F2')
+        .setAuthor({ 
+          name: `Profil Aktywności: ${targetUser.username}`, 
+          iconURL: targetUser.displayAvatarURL({ dynamic: true }) 
+        })
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true, size: 256 }))
         .setDescription(
-          `**Okres:** ${periodLabel}\n\n` +
-          `⏱️ **Spędzony czas:**\n` +
-          '```ansi\n\u001b[1;36m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-          (rank ? `🏆 **Pozycja w rankingu:** #${rank}` : '')
+          `${voiceStatus}\n\n` +
+          `📊 **Statystyki czasu spędzonego na rozmowach:**`
         )
-        .setTimestamp();
-
-      return interaction.editReply({ embeds: [embed] });
-    }
-  }
-
-  // --- DEDYKOWANA KOMENDA /daily ---
-  if (commandName === 'daily') {
-    await interaction.deferReply();
-    const targetUser = options.getUser('uzytkownik') || user;
-    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'today');
-    const rank = await db.getUserRank(targetUser.id, guildId, 'today');
-
-    const embed = new EmbedBuilder()
-      .setColor('#faa61a')
-      .setTitle(`📅 Czas dzisiejszy — ${targetUser.username}`)
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-      .setDescription(
-        `Spędzony czas dzisiaj:\n` +
-        '```ansi\n\u001b[1;33m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-        `🏆 **Pozycja w dzisiejszym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
-      )
-      .setFooter({ text: 'Ekipa Remontowa Bot' })
-      .setTimestamp();
-
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  // --- DEDYKOWANA KOMENDA /weekly ---
-  if (commandName === 'weekly') {
-    await interaction.deferReply();
-    const targetUser = options.getUser('uzytkownik') || user;
-    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'week');
-    const rank = await db.getUserRank(targetUser.id, guildId, 'week');
-
-    const embed = new EmbedBuilder()
-      .setColor('#7289da')
-      .setTitle(`📆 Czas tygodniowy — ${targetUser.username}`)
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-      .setDescription(
-        `Spędzony czas w bieżącym tygodniu (od poniedziałku):\n` +
-        '```ansi\n\u001b[1;34m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-        `🏆 **Pozycja w tygodniowym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
-      )
-      .setFooter({ text: 'Ekipa Remontowa Bot' })
-      .setTimestamp();
-
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  // --- DEDYKOWANA KOMENDA /monthly ---
-  if (commandName === 'monthly') {
-    await interaction.deferReply();
-    const targetUser = options.getUser('uzytkownik') || user;
-    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'month');
-    const rank = await db.getUserRank(targetUser.id, guildId, 'month');
-
-    const embed = new EmbedBuilder()
-      .setColor('#eb459e')
-      .setTitle(`🗓️ Czas miesięczny — ${targetUser.username}`)
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-      .setDescription(
-        `Spędzony czas w bieżącym miesiącu:\n` +
-        '```ansi\n\u001b[1;35m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-        `🏆 **Pozycja w miesięcznym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
-      )
-      .setFooter({ text: 'Ekipa Remontowa Bot' })
-      .setTimestamp();
-
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  // --- KOMENDA /leaderboard (Z PAGINACJĄ I OKRESAMI) ---
-  if (commandName === 'leaderboard') {
-    await interaction.deferReply();
-
-    const period = options.getString('okres') || 'all';
-    const page = options.getInteger('strona') || 1;
-
-    const view = await buildLeaderboardView(guildId, period, page);
-    return interaction.editReply(view);
-  }
-
-  // --- POMOCNICZE METODY DO CZYSZENIA WIADOMOŚCI ---
-  async function fetchManyMessages(channel, limit) {
-    let allMessages = [];
-    let lastId = null;
-    
-    while (allMessages.length < limit) {
-      const fetchLimit = Math.min(100, limit - allMessages.length);
-      const options = { limit: fetchLimit };
-      if (lastId) {
-        options.before = lastId;
-      }
-      
-      const fetched = await channel.messages.fetch(options);
-      if (fetched.size === 0) break;
-      
-      allMessages.push(...fetched.values());
-      lastId = fetched.last().id;
-      
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    
-    return allMessages;
-  }
-
-  function chunkArray(array, size) {
-    const chunks = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
-  }
-
-  if (commandName === 'clear') {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-      return interaction.reply({ 
-        content: 'Nie masz uprawnień do zarządzania wiadomościami.', 
-        flags: [MessageFlags.Ephemeral]
-      });
-    }
-
-    if (activeClearChannels.has(interaction.channelId)) {
-      return interaction.reply({
-        content: 'Na tym kanale trwa już proces powolnego czyszczenia wiadomości. Użyj komendy `/stop`, aby go przerwać.',
-        flags: [MessageFlags.Ephemeral]
-      });
-    }
-
-    const amount = options.getInteger('ilosc');
-    const deleteOld = options.getBoolean('usun_bardzo_stare') !== false;
-    const delaySeconds = options.getInteger('opoznienie_sekundy') || 2;
-    const olderThanMinutes = options.getInteger('starsze_niz_minuty');
-    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
-    activeClearChannels.add(interaction.channelId);
-
-    try {
-      const fetchLimit = Math.max(100, amount);
-      await interaction.editReply(`Pobieranie wiadomości z kanału (skanowanie ostatnich ${fetchLimit})...`);
-      
-      let messages = await fetchManyMessages(interaction.channel, fetchLimit);
-      const now = Date.now();
-
-      if (olderThanMinutes !== null && olderThanMinutes !== undefined) {
-        const minAgeMs = olderThanMinutes * 60 * 1000;
-        messages = messages.filter(msg => (now - msg.createdAt.getTime()) > minAgeMs);
-      }
-
-      messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-
-      const messagesToDelete = messages.slice(0, amount);
-      const totalMessagesToProcess = messagesToDelete.length;
-
-      if (totalMessagesToProcess === 0) {
-        activeClearChannels.delete(interaction.channelId);
-        return interaction.editReply('Nie znaleziono wiadomości spełniających Twoje kryteria do usunięcia na tym kanale.');
-      }
-
-      const youngMessages = messagesToDelete.filter(msg => {
-        const age = now - msg.createdAt.getTime();
-        return age < 14 * 24 * 60 * 60 * 1000 && !msg.pinned;
-      });
-
-      let totalDeleted = 0;
-      
-      if (youngMessages.length > 0) {
-        await interaction.editReply(`Znaleziono **${youngMessages.length}** starszych wiadomości (ale młodszych niż 14 dni). Rozpoczynam usuwanie hurtowe...`);
-        const youngChunks = chunkArray(youngMessages, 100);
-        for (const chunk of youngChunks) {
-          if (!activeClearChannels.has(interaction.channelId)) {
-            break;
+        .addFields(
+          {
+            name: '📅 Dzisiaj',
+            value: `⏱️ **${formatDuration(stats.today)}**\n🏆 Pozycja: **${formatRank(stats.ranks.today)}**`,
+            inline: true
+          },
+          {
+            name: '📆 Ten tydzień',
+            value: `⏱️ **${formatDuration(stats.week)}**\n🏆 Pozycja: **${formatRank(stats.ranks.week)}**`,
+            inline: true
+          },
+          {
+            name: '🗓️ Ten miesiąc',
+            value: `⏱️ **${formatDuration(stats.month)}**\n🏆 Pozycja: **${formatRank(stats.ranks.month)}**`,
+            inline: true
+          },
+          {
+            name: '🏆 Łącznie (All-time)',
+            value: `⏱️ **${formatDuration(stats.total)}**\n🥇 Pozycja w rankingu: **${formatRank(stats.ranks.total)}**`,
+            inline: false
           }
-          const deleted = await interaction.channel.bulkDelete(chunk, true);
-          totalDeleted += deleted.size;
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+        )
+        .setFooter({ text: 'Ekipa Remontowa Bot • Strefa czasowa: Europe/Warsaw' })
+        .setTimestamp();
+
+      if (member?.joinedTimestamp) {
+        const joinedUnix = Math.floor(member.joinedTimestamp / 1000);
+        embed.addFields({
+          name: '🛡️ Informacje o użytkowniku',
+          value: `Dołączył(a) na serwer: <t:${joinedUnix}:D> (<t:${joinedUnix}:R>)`,
+          inline: false
+        });
       }
 
-      const oldMessages = messagesToDelete.filter(msg => {
-        const age = now - msg.createdAt.getTime();
-        const isAlreadyDeleted = youngMessages.some(ym => ym.id === msg.id);
-        return age >= 14 * 24 * 60 * 60 * 1000 && !msg.pinned && !isAlreadyDeleted;
-      });
+      return await interaction.editReply({ embeds: [embed] });
+    }
 
-      if (deleteOld && oldMessages.length > 0 && activeClearChannels.has(interaction.channelId)) {
-        await interaction.editReply(`Pomyślnie usunięto **${totalDeleted}** wiadomości. Rozpoczynam powolne usuwanie **${oldMessages.length}** wiadomości starszych niż 14 dni z opóźnieniem **${delaySeconds} sek.** między każdą z nich...`);
+    // --- KOMENDA /time ---
+    if (commandName === 'time') {
+      await interaction.deferReply();
+
+      const targetUser = options.getUser('uzytkownik') || user;
+      const period = options.getString('okres') || 'all';
+      
+      if (period === 'all') {
+        const stats = await db.getUserStats(targetUser.id, guildId);
+        const embed = new EmbedBuilder()
+          .setColor('#43b581')
+          .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`\n\n` +
+            `📅 **Dzisiaj:** ${formatDuration(stats.today)}\n` +
+            `📆 **Ten tydzień:** ${formatDuration(stats.week)}\n` +
+            `🗓️ **Ten miesiąc:** ${formatDuration(stats.month)}`
+          )
+          .setFooter({ text: 'Użyj /profile aby zobaczyć pozycję w rankingu.' })
+          .setTimestamp();
+
+        return await interaction.editReply({ embeds: [embed] });
+      } else {
+        const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, period);
+        const rank = await db.getUserRank(targetUser.id, guildId, period);
+        const periodLabel = getPeriodLabel(period);
+
+        const embed = new EmbedBuilder()
+          .setColor('#43b581')
+          .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `**Okres:** ${periodLabel}\n\n` +
+            `⏱️ **Spędzony czas:**\n` +
+            '```ansi\n\u001b[1;36m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+            (rank ? `🏆 **Pozycja w rankingu:** #${rank}` : '')
+          )
+          .setTimestamp();
+
+        return await interaction.editReply({ embeds: [embed] });
+      }
+    }
+
+    // --- DEDYKOWANA KOMENDA /daily ---
+    if (commandName === 'daily') {
+      await interaction.deferReply();
+      const targetUser = options.getUser('uzytkownik') || user;
+      const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'today');
+      const rank = await db.getUserRank(targetUser.id, guildId, 'today');
+
+      const embed = new EmbedBuilder()
+        .setColor('#faa61a')
+        .setTitle(`📅 Czas dzisiejszy — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setDescription(
+          `Spędzony czas dzisiaj:\n` +
+          '```ansi\n\u001b[1;33m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+          `🏆 **Pozycja w dzisiejszym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+        )
+        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setTimestamp();
+
+      return await interaction.editReply({ embeds: [embed] });
+    }
+
+    // --- DEDYKOWANA KOMENDA /weekly ---
+    if (commandName === 'weekly') {
+      await interaction.deferReply();
+      const targetUser = options.getUser('uzytkownik') || user;
+      const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'week');
+      const rank = await db.getUserRank(targetUser.id, guildId, 'week');
+
+      const embed = new EmbedBuilder()
+        .setColor('#7289da')
+        .setTitle(`📆 Czas tygodniowy — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setDescription(
+          `Spędzony czas w bieżącym tygodniu (od poniedziałku):\n` +
+          '```ansi\n\u001b[1;34m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+          `🏆 **Pozycja w tygodniowym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+        )
+        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setTimestamp();
+
+      return await interaction.editReply({ embeds: [embed] });
+    }
+
+    // --- DEDYKOWANA KOMENDA /monthly ---
+    if (commandName === 'monthly') {
+      await interaction.deferReply();
+      const targetUser = options.getUser('uzytkownik') || user;
+      const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'month');
+      const rank = await db.getUserRank(targetUser.id, guildId, 'month');
+
+      const embed = new EmbedBuilder()
+        .setColor('#eb459e')
+        .setTitle(`🗓️ Czas miesięczny — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setDescription(
+          `Spędzony czas w bieżącym miesiącu:\n` +
+          '```ansi\n\u001b[1;35m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+          `🏆 **Pozycja w miesięcznym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+        )
+        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setTimestamp();
+
+      return await interaction.editReply({ embeds: [embed] });
+    }
+
+    // --- KOMENDA /leaderboard ---
+    if (commandName === 'leaderboard') {
+      await interaction.deferReply();
+
+      const period = options.getString('okres') || 'all';
+      const page = options.getInteger('strona') || 1;
+
+      const view = await buildLeaderboardView(guildId, period, page);
+      return await interaction.editReply(view);
+    }
+
+    // --- POMOCNICZE METODY DO CZYSZENIA WIADOMOŚCI ---
+    async function fetchManyMessages(channel, limit) {
+      let allMessages = [];
+      let lastId = null;
+      
+      while (allMessages.length < limit) {
+        const fetchLimit = Math.min(100, limit - allMessages.length);
+        const options = { limit: fetchLimit };
+        if (lastId) {
+          options.before = lastId;
+        }
         
-        for (const msg of oldMessages) {
-          if (!activeClearChannels.has(interaction.channelId)) {
-            break;
-          }
-          try {
-            await msg.delete();
-            totalDeleted++;
-            if (totalDeleted % 5 === 0 || totalDeleted === totalMessagesToProcess) {
-              await interaction.editReply(`Trwa usuwanie starych wiadomości... Postęp: **${totalDeleted}** z **${totalMessagesToProcess}** (co ${delaySeconds} sek.).`);
+        const fetched = await channel.messages.fetch(options);
+        if (fetched.size === 0) break;
+        
+        allMessages.push(...fetched.values());
+        lastId = fetched.last().id;
+        
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      
+      return allMessages;
+    }
+
+    function chunkArray(array, size) {
+      const chunks = [];
+      for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+      }
+      return chunks;
+    }
+
+    if (commandName === 'clear') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        return await interaction.reply({ 
+          content: 'Nie masz uprawnień do zarządzania wiadomościami.', 
+          flags: [MessageFlags.Ephemeral]
+        });
+      }
+
+      if (activeClearChannels.has(interaction.channelId)) {
+        return await interaction.reply({
+          content: 'Na tym kanale trwa już proces powolnego czyszczenia wiadomości. Użyj komendy `/stop`, aby go przerwać.',
+          flags: [MessageFlags.Ephemeral]
+        });
+      }
+
+      const amount = options.getInteger('ilosc');
+      const deleteOld = options.getBoolean('usun_bardzo_stare') !== false;
+      const delaySeconds = options.getInteger('opoznienie_sekundy') || 2;
+      const olderThanMinutes = options.getInteger('starsze_niz_minuty');
+      await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+      activeClearChannels.add(interaction.channelId);
+
+      try {
+        const fetchLimit = Math.max(100, amount);
+        await interaction.editReply(`Pobieranie wiadomości z kanału (skanowanie ostatnich ${fetchLimit})...`);
+        
+        let messages = await fetchManyMessages(interaction.channel, fetchLimit);
+        const now = Date.now();
+
+        if (olderThanMinutes !== null && olderThanMinutes !== undefined) {
+          const minAgeMs = olderThanMinutes * 60 * 1000;
+          messages = messages.filter(msg => (now - msg.createdAt.getTime()) > minAgeMs);
+        }
+
+        messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+
+        const messagesToDelete = messages.slice(0, amount);
+        const totalMessagesToProcess = messagesToDelete.length;
+
+        if (totalMessagesToProcess === 0) {
+          activeClearChannels.delete(interaction.channelId);
+          return await interaction.editReply('Nie znaleziono wiadomości spełniających Twoje kryteria do usunięcia na tym kanale.');
+        }
+
+        const youngMessages = messagesToDelete.filter(msg => {
+          const age = now - msg.createdAt.getTime();
+          return age < 14 * 24 * 60 * 60 * 1000 && !msg.pinned;
+        });
+
+        let totalDeleted = 0;
+        
+        if (youngMessages.length > 0) {
+          await interaction.editReply(`Znaleziono **${youngMessages.length}** starszych wiadomości (ale młodszych niż 14 dni). Rozpoczynam usuwanie hurtowe...`);
+          const youngChunks = chunkArray(youngMessages, 100);
+          for (const chunk of youngChunks) {
+            if (!activeClearChannels.has(interaction.channelId)) {
+              break;
             }
-            await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
-          } catch (err) {
-            if (err.code === 10008 || err.message.includes('Unknown Message')) {
-              console.log(`[/clear] Wiadomość o ID ${msg.id} była już wcześniej usunięta przez kogoś innego.`);
-            } else {
-              console.error('Błąd podczas usuwania pojedynczej wiadomości:', err);
+            const deleted = await interaction.channel.bulkDelete(chunk, true);
+            totalDeleted += deleted.size;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+
+        const oldMessages = messagesToDelete.filter(msg => {
+          const age = now - msg.createdAt.getTime();
+          const isAlreadyDeleted = youngMessages.some(ym => ym.id === msg.id);
+          return age >= 14 * 24 * 60 * 60 * 1000 && !msg.pinned && !isAlreadyDeleted;
+        });
+
+        if (deleteOld && oldMessages.length > 0 && activeClearChannels.has(interaction.channelId)) {
+          await interaction.editReply(`Pomyślnie usunięto **${totalDeleted}** wiadomości. Rozpoczynam powolne usuwanie **${oldMessages.length}** wiadomości starszych niż 14 dni z opóźnieniem **${delaySeconds} sek.** między każdą z nich...`);
+          
+          for (const msg of oldMessages) {
+            if (!activeClearChannels.has(interaction.channelId)) {
+              break;
+            }
+            try {
+              await msg.delete();
+              totalDeleted++;
+              if (totalDeleted % 5 === 0 || totalDeleted === totalMessagesToProcess) {
+                await interaction.editReply(`Trwa usuwanie starych wiadomości... Postęp: **${totalDeleted}** z **${totalMessagesToProcess}** (co ${delaySeconds} sek.).`);
+              }
+              await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
+            } catch (err) {
+              if (err.code === 10008 || err.message.includes('Unknown Message')) {
+                // ignoruj
+              } else {
+                console.error('Błąd podczas usuwania pojedynczej wiadomości:', err.message);
+              }
             }
           }
         }
+
+        if (totalDeleted > 0) {
+          await db.incrementDeletedMessages(totalDeleted);
+        }
+        
+        const wasAborted = !activeClearChannels.has(interaction.channelId);
+
+        const embed = new EmbedBuilder()
+          .setColor(wasAborted ? '#f04747' : '#43b581')
+          .setTitle(wasAborted ? '⚠️ Czyszczenie przerwane' : '🗑️ Usuwanie zakończone')
+          .setDescription(wasAborted 
+            ? `Proces czyszczenia został zatrzymany przez administratora. Usunięto łącznie **${totalDeleted}** wiadomości.`
+            : `Pomyślnie usunięto **${totalDeleted}** z **${totalMessagesToProcess}** przeanalizowanych wiadomości z tego kanału.`)
+          .setFooter({ text: 'Statystyki usuniętych wiadomości zostały zaktualizowane.' });
+
+        await interaction.editReply({ content: null, embeds: [embed] });
+      } catch (error) {
+        console.error('Błąd podczas usuwania wiadomości:', error.message);
+        await interaction.editReply({ content: 'Wystąpił błąd podczas usuwania wiadomości. Upewnij się, że bot ma odpowiednie uprawnienia.', embeds: [] });
+      } finally {
+        activeClearChannels.delete(interaction.channelId);
+      }
+    }
+
+    if (commandName === 'stop') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        return await interaction.reply({ 
+          content: 'Nie masz uprawnień do zatrzymywania czyszczenia.', 
+          flags: [MessageFlags.Ephemeral]
+        });
       }
 
-      if (totalDeleted > 0) {
-        await db.incrementDeletedMessages(totalDeleted);
+      if (activeClearChannels.has(interaction.channelId)) {
+        activeClearChannels.delete(interaction.channelId);
+        return await interaction.reply({ 
+          content: '⚙️ Otrzymałem żądanie zatrzymania czyszczenia. Proces zostanie zatrzymany w ciągu kilku sekund.', 
+          flags: [MessageFlags.Ephemeral]
+        });
+      } else {
+        return await interaction.reply({ 
+          content: 'Na tym kanale nie trwa obecnie żadne powolne usuwanie wiadomości.', 
+          flags: [MessageFlags.Ephemeral]
+        });
       }
-      
-      const wasAborted = !activeClearChannels.has(interaction.channelId);
+    }
+
+    if (commandName === 'autoclean') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+        return await interaction.reply({ 
+          content: 'Nie masz uprawnień do zmiany statusu automatycznego czyszczenia.', 
+          flags: [MessageFlags.Ephemeral]
+        });
+      }
+
+      const status = options.getBoolean('status');
+      isAutoCleanEnabled = status;
 
       const embed = new EmbedBuilder()
-        .setColor(wasAborted ? '#f04747' : '#43b581')
-        .setTitle(wasAborted ? '⚠️ Czyszczenie przerwane' : '🗑️ Usuwanie zakończone')
-        .setDescription(wasAborted 
-          ? `Proces czyszczenia został zatrzymany przez administratora. Usunięto łącznie **${totalDeleted}** wiadomości.`
-          : `Pomyślnie usunięto **${totalDeleted}** z **${totalMessagesToProcess}** przeanalizowanych wiadomości z tego kanału.`)
-        .setFooter({ text: 'Statystyki usuniętych wiadomości zostały zaktualizowane.' });
+        .setColor(status ? '#43b581' : '#f04747')
+        .setTitle('⚙️ Automatyczne czyszczenie kanału')
+        .setDescription(`Automatyczne czyszczenie kanału zostało **${status ? 'WŁĄCZONE' : 'WYŁĄCZONE'}**.`);
 
-      await interaction.editReply({ content: null, embeds: [embed] });
-    } catch (error) {
-      console.error('Błąd podczas usuwania wiadomości:', error);
-      await interaction.editReply({ content: 'Wystąpił błąd podczas usuwania wiadomości. Upewnij się, że bot ma odpowiednie uprawnienia.', embeds: [] });
-    } finally {
-      activeClearChannels.delete(interaction.channelId);
+      return await interaction.reply({ embeds: [embed] });
     }
-  }
-
-  if (commandName === 'stop') {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-      return interaction.reply({ 
-        content: 'Nie masz uprawnień do zatrzymywania czyszczenia.', 
-        flags: [MessageFlags.Ephemeral]
-      });
+  } catch (error) {
+    console.error('❌ Nieoczekiwany błąd podczas obsługi interakcji:', error);
+    const errorMsg = '⚠️ Wystąpił błąd podczas wykonywania tej komendy. Spróbuj ponownie.';
+    if (interaction.isRepliable()) {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: errorMsg, embeds: [], components: [] }).catch(() => null);
+      } else {
+        await interaction.reply({ content: errorMsg, flags: [MessageFlags.Ephemeral] }).catch(() => null);
+      }
     }
-
-    if (activeClearChannels.has(interaction.channelId)) {
-      activeClearChannels.delete(interaction.channelId);
-      return interaction.reply({ 
-        content: '⚙️ Otrzymałem żądanie zatrzymania czyszczenia. Proces zostanie zatrzymany w ciągu kilku sekund.', 
-        flags: [MessageFlags.Ephemeral]
-      });
-    } else {
-      return interaction.reply({ 
-        content: 'Na tym kanale nie trwa obecnie żadne powolne usuwanie wiadomości.', 
-        flags: [MessageFlags.Ephemeral]
-      });
-    }
-  }
-
-  if (commandName === 'autoclean') {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-      return interaction.reply({ 
-        content: 'Nie masz uprawnień do zmiany statusu automatycznego czyszczenia.', 
-        flags: [MessageFlags.Ephemeral]
-      });
-    }
-
-    const status = options.getBoolean('status');
-    isAutoCleanEnabled = status;
-
-    const embed = new EmbedBuilder()
-      .setColor(status ? '#43b581' : '#f04747')
-      .setTitle('⚙️ Automatyczne czyszczenie kanału')
-      .setDescription(`Automatyczne czyszczenie kanału zostało **${status ? 'WŁĄCZONE' : 'WYŁĄCZONE'}**.`);
-
-    return interaction.reply({ embeds: [embed] });
   }
 });
 
@@ -979,7 +990,7 @@ async function cleanChannel(channelId, lifetimeMinutes) {
       autoCleanTimeout = setTimeout(() => cleanChannel(channelId, lifetimeMinutes), nextRunMs);
     }
   } catch (error) {
-    console.error('[AutoClean] Błąd podczas czyszczenia wiadomości:', error);
+    console.error('[AutoClean] Błąd podczas czyszczenia wiadomości:', error.message);
   } finally {
     isCleanChannelRunning = false;
     if (shouldReRunClean) {
