@@ -212,7 +212,7 @@ async function buildLeaderboardView(guildId, period = 'all', page = 1) {
         }).join('\n\n')
     ))
     .setFooter({ 
-      text: `Strona ${actualPage} z ${totalPages} • Osób w rankingu: ${totalCount} • Ekipa Remontowa Bot` 
+      text: `Strona ${actualPage} z ${totalPages} • Osób: ${totalCount} • Czas liczony od 25.06.2026 • Ekipa Remontowa` 
     })
     .setTimestamp();
 
@@ -554,12 +554,12 @@ client.on('interactionCreate', async (interaction) => {
             inline: true
           },
           {
-            name: '🏆 Łącznie (All-time)',
+            name: '🏆 Łącznie (od 25.06.2026)',
             value: `⏱️ **${formatDuration(stats.total)}**\n🥇 Pozycja w rankingu: **${formatRank(stats.ranks.total)}**`,
             inline: false
           }
         )
-        .setFooter({ text: 'Ekipa Remontowa Bot • Strefa czasowa: Europe/Warsaw' })
+        .setFooter({ text: 'Ekipa Remontowa Bot • Czas liczony od 25.06.2026 • Europe/Warsaw' })
         .setTimestamp();
 
       if (member?.joinedTimestamp) {
@@ -595,12 +595,12 @@ client.on('interactionCreate', async (interaction) => {
           .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
           .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
           .setDescription(
-            `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`${liveInfo}\n` +
+            `⏱️ **Łączny czas (od 25.06.2026):** \`${formatDuration(stats.total)}\`${liveInfo}\n` +
             `📅 **Dzisiaj:** ${formatDuration(stats.today)}\n` +
             `📆 **Ten tydzień:** ${formatDuration(stats.week)}\n` +
             `🗓️ **Ten miesiąc:** ${formatDuration(stats.month)}`
           )
-          .setFooter({ text: 'Użyj /profile aby zobaczyć pełny profil i pozycje w rankingu.' })
+          .setFooter({ text: 'Czas liczony od 25.06.2026 • Użyj /profile aby zobaczyć pozycje w rankingu.' })
           .setTimestamp();
 
         return await interaction.editReply({ embeds: [embed] });
