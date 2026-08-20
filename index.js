@@ -31,11 +31,27 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-  res.send({ status: 'ok', message: 'Bot Ekipa Remontowa jest aktywny!' });
+  res.send({ status: 'ok', message: 'Bot Ekipa Remontowa jest aktywny!', discordReady: client.isReady() });
 });
 
 app.get('/healthz', (req, res) => {
   res.status(200).send('OK');
+});
+
+app.get('/diag', (req, res) => {
+  const token = process.env.DISCORD_TOKEN;
+  res.send({
+    status: 'ok',
+    discordReady: client.isReady(),
+    botUser: client.user ? client.user.tag : null,
+    hasToken: !!token && token !== 'twoj_token_bota_tutaj',
+    tokenPrefix: token ? `${token.substring(0, 7)}...` : null,
+    hasGuildId: !!process.env.GUILD_ID && process.env.GUILD_ID !== 'twoje_guild_id_tutaj',
+    guildId: process.env.GUILD_ID,
+    hasCleanChannelId: !!process.env.CLEAN_CHANNEL_ID,
+    hasDatabaseUrl: !!process.env.DATABASE_URL && process.env.DATABASE_URL !== 'twój_connection_string_supabase_tutaj',
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
