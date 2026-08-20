@@ -1003,7 +1003,14 @@ async function cleanChannel(channelId, lifetimeMinutes) {
 // Zaloguj bota
 const token = process.env.DISCORD_TOKEN;
 if (token && token !== 'twoj_token_bota_tutaj') {
-  client.login(token);
+  console.log('🔄 Rozpoczynam logowanie do Discord Gateway (Token jest obecny)...');
+  client.login(token)
+    .then(() => {
+      console.log('✅ Połączenie z bramą Discord nawiązane pomyślnie.');
+    })
+    .catch((err) => {
+      console.error('❌ KRYTYCZNY BŁĄD PODCZAS LOGOWANIA DO DISCORDA:', err);
+    });
 } else {
-  console.error('BŁĄD: Brak podanego tokenu bota w pliku .env! Bot nie został zalogowany.');
+  console.error('❌ BŁĄD: Brak podanego tokenu bota (DISCORD_TOKEN) w zmiennych środowiskowych! Bot nie został zalogowany.');
 }
