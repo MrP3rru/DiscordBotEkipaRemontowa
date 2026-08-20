@@ -38,8 +38,8 @@ app.get('/healthz', (req, res) => {
   res.status(200).send('OK');
 });
 
-app.listen(PORT, () => {
-  console.log(`Serwer HTTP nasłuchuje na porcie ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Serwer HTTP nasłuchuje na porcie ${PORT} (0.0.0.0)`);
 });
 
 
