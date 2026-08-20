@@ -109,9 +109,6 @@ async function queryPg(text, params = []) {
   try {
     return await pgPool.query(text, params);
   } catch (error) {
-    // Kod 57P01: terminating connection due to administrator command (np. restart / timeout Supabase poolera)
-    // Kod 57P03: cannot_connect_now
-    // ECONNRESET / Connection terminated
     const isTransientError = error.code === '57P01' || 
                              error.code === '57P03' || 
                              error.code === '08006' ||
@@ -208,12 +205,10 @@ async function initDatabase() {
         allowExitOnIdle: false
       });
 
-      // Obsługa błędów bezczynnego klienta w puli (zapobiega nieobsłużonym błędom Node.js)
       pgPool.on('error', (err) => {
         console.warn('⚠️ [PostgreSQL Pool] Ostrzeżenie bezczynnego klienta (zostanie zrestartowany):', err.message);
       });
 
-      // Test połączenia i migracja tabel
       await queryPg(`
         CREATE TABLE IF NOT EXISTS active_sessions (
           user_id VARCHAR(30) PRIMARY KEY,
@@ -374,6 +369,68 @@ async function endVoiceSession(userId, guildId) {
 
   } catch (error) {
     console.error(`Błąd podczas kończenia sesji dla ${userId}:`, error);
+  }
+}
+
+/**
+ * Zapisuje postęp trwających sesji w tle (checkpoint), zapobiegając utracie godzin przy restarcie i zapewniając idealne rozliczanie dni.
+ */
+async function checkpointActiveSessions() {
+  try {
+    const now = Date.now();
+    let sessions = [];
+    if (isPostgres && pgPool) {
+      const res = await queryPg('SELECT user_id, guild_id, join_time, channel_id FROM active_sessions');
+      sessions = res.rows;
+    } else if (dbSQLite) {
+      sessions = await dbSQLite.all('SELECT user_id, guild_id, join_time, channel_id FROM active_sessions');
+    }
+
+    for (const s of sessions) {
+      const joinTime = Number(s.join_time);
+      const duration = now - joinTime;
+      // Wykonujemy checkpoint tylko jeśli sesja trwa co najmniej 1 minutę
+      if (duration >= 60000) {
+        const chunks = splitSessionByDays(joinTime, now);
+        if (isPostgres && pgPool) {
+          await queryPg(
+            `INSERT INTO user_times (user_id, guild_id, total_time) VALUES ($1, $2, $3)
+             ON CONFLICT(user_id, guild_id) DO UPDATE SET total_time = user_times.total_time + EXCLUDED.total_time`,
+            [s.user_id, s.guild_id, duration]
+          );
+          for (const chunk of chunks) {
+            await queryPg(
+              `INSERT INTO user_daily_times (user_id, guild_id, date, time_spent) VALUES ($1, $2, $3, $4)
+               ON CONFLICT(user_id, guild_id, date) DO UPDATE SET time_spent = user_daily_times.time_spent + EXCLUDED.time_spent`,
+              [s.user_id, s.guild_id, chunk.date, chunk.duration]
+            );
+          }
+          await queryPg(
+            `UPDATE active_sessions SET join_time = $1 WHERE user_id = $2 AND guild_id = $3`,
+            [now, s.user_id, s.guild_id]
+          );
+        } else if (dbSQLite) {
+          await dbSQLite.run(
+            `INSERT INTO user_times (user_id, guild_id, total_time) VALUES (?, ?, ?)
+             ON CONFLICT(user_id, guild_id) DO UPDATE SET total_time = total_time + ?`,
+            [s.user_id, s.guild_id, duration, duration]
+          );
+          for (const chunk of chunks) {
+            await dbSQLite.run(
+              `INSERT INTO user_daily_times (user_id, guild_id, date, time_spent) VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id, guild_id, date) DO UPDATE SET time_spent = time_spent + ?`,
+              [s.user_id, s.guild_id, chunk.date, chunk.duration, chunk.duration]
+            );
+          }
+          await dbSQLite.run(
+            `UPDATE active_sessions SET join_time = ? WHERE user_id = ? AND guild_id = ?`,
+            [now, s.user_id, s.guild_id]
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Ostrzeżenie podczas checkpointActiveSessions:', err.message);
   }
 }
 
@@ -823,6 +880,7 @@ module.exports = {
   initDatabase,
   startVoiceSession,
   endVoiceSession,
+  checkpointActiveSessions,
   getUserTime,
   getUserPeriodTime,
   getUserStats,

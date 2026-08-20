@@ -446,6 +446,7 @@ client.once('ready', async () => {
   updateApplicationBio();
   setInterval(updatePresence, 30000); // co 30 sekund
   setInterval(updateApplicationBio, 300000); // co 5 minut (bezpiecznie przed rate limitem)
+  setInterval(db.checkpointActiveSessions, 300000); // co 5 minut zapisywanie sesji w tle
 
   // Uruchomienie pętli automatycznego usuwania wiadomości
   startAutoCleanLoop();
@@ -517,7 +518,10 @@ client.on('interactionCreate', async (interaction) => {
       if (stats.activeSession) {
         const channelMention = stats.activeSession.channel_id ? `<#${stats.activeSession.channel_id}>` : 'kanał głosowy';
         const joinUnix = Math.floor(stats.activeSession.join_time / 1000);
-        voiceStatus = `🟢 **Status:** Na kanale ${channelMention} (od <t:${joinUnix}:R>)`;
+        const currentSessionDuration = Date.now() - stats.activeSession.join_time;
+        voiceStatus = 
+          `🟢 **Status:** Na kanale ${channelMention}\n` +
+          `⏱️ **Bieżąca sesja:** od **<t:${joinUnix}:t>** (<t:${joinUnix}:R>) • trwa: **${formatDuration(currentSessionDuration)}**`;
       }
 
       const formatRank = (r) => (r ? `#${r}` : '-');
@@ -579,17 +583,24 @@ client.on('interactionCreate', async (interaction) => {
       
       if (period === 'all') {
         const stats = await db.getUserStats(targetUser.id, guildId);
+        let liveInfo = '';
+        if (stats.activeSession) {
+          const joinUnix = Math.floor(stats.activeSession.join_time / 1000);
+          const dur = Date.now() - stats.activeSession.join_time;
+          liveInfo = `\n🟢 **Aktywny na kanale:** od <t:${joinUnix}:t> (trwa: ${formatDuration(dur)})\n`;
+        }
+
         const embed = new EmbedBuilder()
           .setColor('#43b581')
           .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
           .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
           .setDescription(
-            `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`\n\n` +
+            `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`${liveInfo}\n` +
             `📅 **Dzisiaj:** ${formatDuration(stats.today)}\n` +
             `📆 **Ten tydzień:** ${formatDuration(stats.week)}\n` +
             `🗓️ **Ten miesiąc:** ${formatDuration(stats.month)}`
           )
-          .setFooter({ text: 'Użyj /profile aby zobaczyć pozycję w rankingu.' })
+          .setFooter({ text: 'Użyj /profile aby zobaczyć pełny profil i pozycje w rankingu.' })
           .setTimestamp();
 
         return await interaction.editReply({ embeds: [embed] });
@@ -597,6 +608,13 @@ client.on('interactionCreate', async (interaction) => {
         const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, period);
         const rank = await db.getUserRank(targetUser.id, guildId, period);
         const periodLabel = getPeriodLabel(period);
+        const activeSession = await db.getActiveSession(targetUser.id, guildId);
+        let liveInfo = '';
+        if (activeSession) {
+          const joinUnix = Math.floor(activeSession.join_time / 1000);
+          const dur = Date.now() - activeSession.join_time;
+          liveInfo = `\n🟢 **Aktywny na kanale:** od <t:${joinUnix}:t> (trwa: ${formatDuration(dur)})\n`;
+        }
 
         const embed = new EmbedBuilder()
           .setColor('#43b581')
@@ -606,7 +624,8 @@ client.on('interactionCreate', async (interaction) => {
             `**Okres:** ${periodLabel}\n\n` +
             `⏱️ **Spędzony czas:**\n` +
             '```ansi\n\u001b[1;36m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-            (rank ? `🏆 **Pozycja w rankingu:** #${rank}` : '')
+            (rank ? `🏆 **Pozycja w rankingu:** #${rank}\n` : '') +
+            liveInfo
           )
           .setTimestamp();
 
@@ -620,6 +639,13 @@ client.on('interactionCreate', async (interaction) => {
       const targetUser = options.getUser('uzytkownik') || user;
       const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'today');
       const rank = await db.getUserRank(targetUser.id, guildId, 'today');
+      const activeSession = await db.getActiveSession(targetUser.id, guildId);
+      let liveInfo = '';
+      if (activeSession) {
+        const joinUnix = Math.floor(activeSession.join_time / 1000);
+        const dur = Date.now() - activeSession.join_time;
+        liveInfo = `\n🟢 **Aktywny na kanale:** od <t:${joinUnix}:t> (trwa: ${formatDuration(dur)})\n`;
+      }
 
       const embed = new EmbedBuilder()
         .setColor('#faa61a')
@@ -628,9 +654,10 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(
           `Spędzony czas dzisiaj:\n` +
           '```ansi\n\u001b[1;33m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-          `🏆 **Pozycja w dzisiejszym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+          `🏆 **Pozycja w dzisiejszym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}\n` +
+          liveInfo
         )
-        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setFooter({ text: 'Ekipa Remontowa Bot • Czas resetuje się codziennie o 00:00' })
         .setTimestamp();
 
       return await interaction.editReply({ embeds: [embed] });
@@ -642,6 +669,13 @@ client.on('interactionCreate', async (interaction) => {
       const targetUser = options.getUser('uzytkownik') || user;
       const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'week');
       const rank = await db.getUserRank(targetUser.id, guildId, 'week');
+      const activeSession = await db.getActiveSession(targetUser.id, guildId);
+      let liveInfo = '';
+      if (activeSession) {
+        const joinUnix = Math.floor(activeSession.join_time / 1000);
+        const dur = Date.now() - activeSession.join_time;
+        liveInfo = `\n🟢 **Aktywny na kanale:** od <t:${joinUnix}:t> (trwa: ${formatDuration(dur)})\n`;
+      }
 
       const embed = new EmbedBuilder()
         .setColor('#7289da')
@@ -650,9 +684,10 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(
           `Spędzony czas w bieżącym tygodniu (od poniedziałku):\n` +
           '```ansi\n\u001b[1;34m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-          `🏆 **Pozycja w tygodniowym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+          `🏆 **Pozycja w tygodniowym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}\n` +
+          liveInfo
         )
-        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setFooter({ text: 'Ekipa Remontowa Bot • Czas resetuje się co poniedziałek o 00:00' })
         .setTimestamp();
 
       return await interaction.editReply({ embeds: [embed] });
@@ -664,6 +699,13 @@ client.on('interactionCreate', async (interaction) => {
       const targetUser = options.getUser('uzytkownik') || user;
       const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'month');
       const rank = await db.getUserRank(targetUser.id, guildId, 'month');
+      const activeSession = await db.getActiveSession(targetUser.id, guildId);
+      let liveInfo = '';
+      if (activeSession) {
+        const joinUnix = Math.floor(activeSession.join_time / 1000);
+        const dur = Date.now() - activeSession.join_time;
+        liveInfo = `\n🟢 **Aktywny na kanale:** od <t:${joinUnix}:t> (trwa: ${formatDuration(dur)})\n`;
+      }
 
       const embed = new EmbedBuilder()
         .setColor('#eb459e')
@@ -672,9 +714,10 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(
           `Spędzony czas w bieżącym miesiącu:\n` +
           '```ansi\n\u001b[1;35m' + formatDuration(timeMs) + '\u001b[0m\n```' +
-          `🏆 **Pozycja w miesięcznym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+          `🏆 **Pozycja w miesięcznym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}\n` +
+          liveInfo
         )
-        .setFooter({ text: 'Ekipa Remontowa Bot' })
+        .setFooter({ text: 'Ekipa Remontowa Bot • Czas resetuje się 1. dnia każdego miesiąca' })
         .setTimestamp();
 
       return await interaction.editReply({ embeds: [embed] });
