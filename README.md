@@ -4,15 +4,21 @@ Bot Discord dedykowany dla serwera **Ekipa Remontowa**, służący do monitorowa
 
 ## 🚀 Główne Funkcje
 
-1. **Monitorowanie Czasu Głosowego**: Automatycznie zlicza czas spędzony przez użytkowników na kanałach głosowych.
-2. **Rankingi i Statystyki**: 
-   - `/time [uzytkownik]` – sprawdza łączny czas spędzony na rozmowach.
-   - `/leaderboard` – pokazuje TOP 10 najbardziej aktywnych osób na serwerze.
-3. **Automatyczne Czyszczenie Kanału**: Co określony czas (np. 5 minut) usuwa wiadomości starsze niż zadany limit (np. 1 godzina) na wskazanym kanale.
-4. **Komenda Admina**:
-   - `/clear <ilość>` – natychmiastowe czyszczenie określonej liczby wiadomości przez moderatorów.
-5. **Działa 24/7 na Render**: Wbudowany serwer Express.js odpowiada na pingi zewnętrzne, dzięki czemu bot nie wyłącza się (nie przechodzi w stan uśpienia).
-6. **Integracja z Discord Profile**: Po zarejestrowaniu komend Slash są one widoczne bezpośrednio w profilu bota (tak jak na Twoim zrzucie ekranu!).
+1. **Monitorowanie Czasu Głosowego**: Automatycznie zlicza czas spędzony przez użytkowników na kanałach głosowych z dokładnym podziałem dziennym, tygodniowym i miesięcznym.
+2. **Profile, Rankingi i Statystyki**: 
+   - `/profile [uzytkownik]` – szczegółowy, estetyczny profil aktywności głosowej (dzisiaj, tydzień, miesiąc, łącznie, pozycje w rankingu oraz status na kanale na żywo).
+   - `/daily [uzytkownik]` – czas spędzony na rozmowach dzisiaj oraz pozycja w rankingu dnia.
+   - `/weekly [uzytkownik]` – czas spędzony w bieżącym tygodniu (od poniedziałku) oraz pozycja w rankingu tygodniowym.
+   - `/monthly [uzytkownik]` – czas spędzony w bieżącym miesiącu oraz pozycja w rankingu miesięcznym.
+   - `/time [uzytkownik] [okres]` – szybkie sprawdzenie czasu dla wybranego okresu lub łącznie.
+   - `/leaderboard [okres] [strona]` – interaktywny ranking TOP użytkowników z podziałem na strony (przyciski `◀ Poprzednia` / `Następna ▶`) oraz filtrowaniem okresów (`łącznie`, `dzisiaj`, `tydzień`, `miesiąc`).
+3. **Automatyczne Czyszczenie Kanału**: Co określony czas usuwa wiadomości starsze niż zadany limit na wskazanym kanale.
+4. **Komendy Moderacyjne**:
+   - `/clear <ilość>` – natychmiastowe czyszczenie wiadomości (również starszych niż 14 dni).
+   - `/stop` – zatrzymanie powolnego usuwania starych wiadomości.
+   - `/autoclean <status>` – włączanie/wyłączanie automatycznego czyszczenia.
+5. **Działa 24/7 na Render**: Wbudowany serwer Express.js odpowiada na pingi zewnętrzne, dzięki czemu bot nie przechodzi w stan uśpienia.
+6. **Baza Danych PostgreSQL (Supabase) + SQLite**: Pełna trwałość danych bez ryzyka utraty godzin po restarcie.
 
 ---
 

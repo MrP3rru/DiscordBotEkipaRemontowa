@@ -9,6 +9,109 @@ let pgPool = null;
 let isPostgres = false;
 
 /**
+ * Zwraca datę w formacie YYYY-MM-DD dla strefy czasowej Europe/Warsaw
+ */
+function getWarsawDateString(timestamp = Date.now()) {
+  const d = new Date(timestamp);
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Warsaw',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  return formatter.format(d); // np. "2026-08-20"
+}
+
+/**
+ * Zwraca zakres dat (start i end w formacie YYYY-MM-DD) dla bieżącego tygodnia (od poniedziałku do niedzieli)
+ */
+function getCurrentWeekRange() {
+  const now = new Date();
+  // Pobieramy aktualną datę w Warszawie
+  const warsawStr = getWarsawDateString(now.getTime());
+  const [year, month, day] = warsawStr.split('-').map(Number);
+  
+  const currentWarsawDate = new Date(Date.UTC(year, month - 1, day));
+  // getUTCDay: 0 = niedziela, 1 = poniedziałek, ..., 6 = sobota
+  const dayOfWeek = currentWarsawDate.getUTCDay();
+  // Obliczamy ile dni odjąć, aby trafić na poniedziałek (poniedziałek = 1, niedziela = 7)
+  const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  
+  const monday = new Date(currentWarsawDate);
+  monday.setUTCDate(currentWarsawDate.getUTCDate() + diffToMonday);
+  
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  
+  const formatDate = (d) => {
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dayNum = String(d.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${dayNum}`;
+  };
+  
+  return {
+    startDate: formatDate(monday),
+    endDate: formatDate(sunday)
+  };
+}
+
+/**
+ * Zwraca zakres dat dla bieżącego miesiąca
+ */
+function getCurrentMonthRange() {
+  const warsawStr = getWarsawDateString();
+  const [year, month] = warsawStr.split('-');
+  return {
+    prefix: `${year}-${month}`,
+    startDate: `${year}-${month}-01`,
+    endDate: `${year}-${month}-31`
+  };
+}
+
+/**
+ * Dzieli sesję głosową na poszczególne dni, jeśli sesja przekroczyła północ.
+ */
+function splitSessionByDays(startMs, endMs) {
+  if (endMs <= startMs) return [];
+
+  const chunks = [];
+  let currentStart = startMs;
+
+  while (currentStart < endMs) {
+    const dateStr = getWarsawDateString(currentStart);
+    // Wyznaczamy początek następnego dnia w strefie polskiej
+    const [y, m, d] = dateStr.split('-').map(Number);
+    // Kolejny dzień o 00:00:00 (w przybliżeniu w UTC + strefa)
+    // Bezpieczne podejście: sprawdzamy co 1 godzinę lub wyznaczamy północ
+    const nextDayDate = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0));
+    // Przeliczamy północ w strefie polskiej na timestamp
+    // Różnica w czasie w Polsce to UTC+1 (zima) lub UTC+2 (lato)
+    // Sprawdzamy kiedy zmieni się data getWarsawDateString
+    let nextMidnightMs = nextDayDate.getTime() - (2 * 60 * 60 * 1000); // próba CEST
+    if (getWarsawDateString(nextMidnightMs) !== dateStr) {
+      // Dostosowanie w razie CET (UTC+1)
+      nextMidnightMs = nextDayDate.getTime() - (1 * 60 * 60 * 1000);
+    }
+    
+    // Jeśli nie wyliczono idealnie, bierzemy koniec sesji lub następny krok
+    const chunkEnd = (nextMidnightMs > currentStart && nextMidnightMs < endMs) ? nextMidnightMs : endMs;
+    const duration = chunkEnd - currentStart;
+
+    if (duration > 0) {
+      chunks.push({
+        date: dateStr,
+        duration: duration
+      });
+    }
+
+    currentStart = chunkEnd;
+  }
+
+  return chunks;
+}
+
+/**
  * Inicjalizuje połączenie z bazą danych (PostgreSQL lub SQLite).
  */
 async function initDatabase() {
@@ -22,20 +125,26 @@ async function initDatabase() {
         ssl: {
           rejectUnauthorized: false
         },
-        connectionTimeoutMillis: 5000 // Limit czasu na połączenie (5 sekund)
+        connectionTimeoutMillis: 5000
       });
 
-      // Test połączenia
       const client = await pgPool.connect();
       try {
-        // Tworzenie tabel w PostgreSQL
         await client.query(`
           CREATE TABLE IF NOT EXISTS active_sessions (
             user_id VARCHAR(30) PRIMARY KEY,
             guild_id VARCHAR(30) NOT NULL,
-            join_time BIGINT NOT NULL
+            join_time BIGINT NOT NULL,
+            channel_id VARCHAR(30)
           )
         `);
+
+        // Sprawdzamy czy kolumna channel_id istnieje (dla istniejących baz)
+        try {
+          await client.query(`ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS channel_id VARCHAR(30)`);
+        } catch (e) {
+          // Ignoruj jeśli już istnieje
+        }
 
         await client.query(`
           CREATE TABLE IF NOT EXISTS user_times (
@@ -47,11 +156,22 @@ async function initDatabase() {
         `);
 
         await client.query(`
+          CREATE TABLE IF NOT EXISTS user_daily_times (
+            user_id VARCHAR(30) NOT NULL,
+            guild_id VARCHAR(30) NOT NULL,
+            date VARCHAR(10) NOT NULL,
+            time_spent BIGINT DEFAULT 0,
+            PRIMARY KEY (user_id, guild_id, date)
+          )
+        `);
+
+        await client.query(`
           CREATE TABLE IF NOT EXISTS system_stats (
             stat_name VARCHAR(50) PRIMARY KEY,
             stat_value BIGINT DEFAULT 0
           )
         `);
+
         isPostgres = true;
         console.log('✅ Pomyślnie połączono z bazą PostgreSQL (Supabase) i zaktualizowano tabele.');
         return;
@@ -79,9 +199,21 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS active_sessions (
         user_id TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
-        join_time INTEGER NOT NULL
+        join_time INTEGER NOT NULL,
+        channel_id TEXT
       )
     `);
+
+    // Sprawdzamy czy kolumna channel_id istnieje w SQLite
+    const tableInfo = await dbSQLite.all(`PRAGMA table_info(active_sessions)`);
+    const hasChannelCol = tableInfo.some(col => col.name === 'channel_id');
+    if (!hasChannelCol) {
+      try {
+        await dbSQLite.exec(`ALTER TABLE active_sessions ADD COLUMN channel_id TEXT`);
+      } catch (e) {
+        // Ignoruj
+      }
+    }
 
     await dbSQLite.exec(`
       CREATE TABLE IF NOT EXISTS user_times (
@@ -89,6 +221,16 @@ async function initDatabase() {
         guild_id TEXT,
         total_time INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, guild_id)
+      )
+    `);
+
+    await dbSQLite.exec(`
+      CREATE TABLE IF NOT EXISTS user_daily_times (
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time_spent INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, guild_id, date)
       )
     `);
 
@@ -106,23 +248,23 @@ async function initDatabase() {
 }
 
 /**
- * Rozpoczyna sesję głosową (zapisuje czas wejścia).
+ * Rozpoczyna sesję głosową (zapisuje czas wejścia oraz ID kanału).
  */
-async function startVoiceSession(userId, guildId) {
+async function startVoiceSession(userId, guildId, channelId = null) {
   const now = Date.now();
   try {
     if (isPostgres && pgPool) {
       await pgPool.query(
-        `INSERT INTO active_sessions (user_id, guild_id, join_time) 
-         VALUES ($1, $2, $3) 
+        `INSERT INTO active_sessions (user_id, guild_id, join_time, channel_id) 
+         VALUES ($1, $2, $3, $4) 
          ON CONFLICT (user_id) 
-         DO UPDATE SET join_time = EXCLUDED.join_time`,
-        [userId, guildId, now]
+         DO UPDATE SET join_time = EXCLUDED.join_time, guild_id = EXCLUDED.guild_id, channel_id = EXCLUDED.channel_id`,
+        [userId, guildId, now, channelId]
       );
     } else if (dbSQLite) {
       await dbSQLite.run(
-        'INSERT OR REPLACE INTO active_sessions (user_id, guild_id, join_time) VALUES (?, ?, ?)',
-        [userId, guildId, now]
+        'INSERT OR REPLACE INTO active_sessions (user_id, guild_id, join_time, channel_id) VALUES (?, ?, ?, ?)',
+        [userId, guildId, now, channelId]
       );
     }
   } catch (error) {
@@ -131,7 +273,7 @@ async function startVoiceSession(userId, guildId) {
 }
 
 /**
- * Kończy sesję głosową, oblicza spędzony czas i zapisuje go do bazy danych.
+ * Kończy sesję głosową, oblicza spędzony czas i zapisuje go do bazy danych (całkowity oraz podział na dni).
  */
 async function endVoiceSession(userId, guildId) {
   try {
@@ -156,7 +298,8 @@ async function endVoiceSession(userId, guildId) {
       return; // Brak aktywnej sesji
     }
 
-    const duration = Date.now() - session.join_time;
+    const now = Date.now();
+    const duration = now - session.join_time;
 
     // Usuń aktywną sesję
     if (isPostgres && pgPool) {
@@ -164,7 +307,8 @@ async function endVoiceSession(userId, guildId) {
         'DELETE FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
       );
-      // Zaktualizuj czas w Postgresie
+
+      // Zaktualizuj łączny czas
       await pgPool.query(
         `INSERT INTO user_times (user_id, guild_id, total_time)
          VALUES ($1, $2, $3)
@@ -172,12 +316,25 @@ async function endVoiceSession(userId, guildId) {
          total_time = user_times.total_time + EXCLUDED.total_time`,
         [userId, guildId, duration]
       );
+
+      // Zaktualizuj czas dzienny (w podziale na poszczególne dni)
+      const dayChunks = splitSessionByDays(session.join_time, now);
+      for (const chunk of dayChunks) {
+        await pgPool.query(
+          `INSERT INTO user_daily_times (user_id, guild_id, date, time_spent)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT(user_id, guild_id, date) DO UPDATE SET
+           time_spent = user_daily_times.time_spent + EXCLUDED.time_spent`,
+          [userId, guildId, chunk.date, chunk.duration]
+        );
+      }
     } else if (dbSQLite) {
       await dbSQLite.run(
         'DELETE FROM active_sessions WHERE user_id = ? AND guild_id = ?',
         [userId, guildId]
       );
-      // Zaktualizuj czas w SQLite
+
+      // Zaktualizuj łączny czas w SQLite
       await dbSQLite.run(
         `INSERT INTO user_times (user_id, guild_id, total_time)
          VALUES (?, ?, ?)
@@ -185,6 +342,18 @@ async function endVoiceSession(userId, guildId) {
          total_time = total_time + ?`,
         [userId, guildId, duration, duration]
       );
+
+      // Zaktualizuj czas dzienny w SQLite
+      const dayChunks = splitSessionByDays(session.join_time, now);
+      for (const chunk of dayChunks) {
+        await dbSQLite.run(
+          `INSERT INTO user_daily_times (user_id, guild_id, date, time_spent)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id, guild_id, date) DO UPDATE SET
+           time_spent = time_spent + ?`,
+          [userId, guildId, chunk.date, chunk.duration, chunk.duration]
+        );
+      }
     }
 
   } catch (error) {
@@ -193,15 +362,82 @@ async function endVoiceSession(userId, guildId) {
 }
 
 /**
- * Pobiera łączny czas spędzony przez użytkownika w milisekundach.
+ * Pobiera aktywną sesję użytkownika na serwerze (jeśli obecnie przebywa na kanale)
+ */
+async function getActiveSession(userId, guildId) {
+  try {
+    if (isPostgres && pgPool) {
+      const res = await pgPool.query(
+        'SELECT join_time, channel_id FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
+        [userId, guildId]
+      );
+      if (res.rows.length > 0) {
+        return {
+          join_time: Number(res.rows[0].join_time),
+          channel_id: res.rows[0].channel_id
+        };
+      }
+    } else if (dbSQLite) {
+      const row = await dbSQLite.get(
+        'SELECT join_time, channel_id FROM active_sessions WHERE user_id = ? AND guild_id = ?',
+        [userId, guildId]
+      );
+      if (row) {
+        return {
+          join_time: Number(row.join_time),
+          channel_id: row.channel_id
+        };
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error(`Błąd pobierania aktywnej sesji dla ${userId}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Oblicza ile z trwającej aktywnej sesji przypada na dziś, ten tydzień, ten miesiąc i łącznie.
+ */
+function getActiveSessionBreakdown(activeSession) {
+  if (!activeSession) {
+    return { today: 0, week: 0, month: 0, total: 0 };
+  }
+
+  const now = Date.now();
+  const chunks = splitSessionByDays(activeSession.join_time, now);
+  const todayStr = getWarsawDateString(now);
+  const weekRange = getCurrentWeekRange();
+  const monthRange = getCurrentMonthRange();
+
+  let today = 0;
+  let week = 0;
+  let month = 0;
+  let total = now - activeSession.join_time;
+
+  for (const chunk of chunks) {
+    if (chunk.date === todayStr) {
+      today += chunk.duration;
+    }
+    if (chunk.date >= weekRange.startDate && chunk.date <= weekRange.endDate) {
+      week += chunk.duration;
+    }
+    if (chunk.date >= monthRange.startDate && chunk.date <= monthRange.endDate) {
+      month += chunk.duration;
+    }
+  }
+
+  return { today, week, month, total };
+}
+
+/**
+ * Pobiera łączny czas spędzony przez użytkownika w milisekundach (dla kompatybilności wstecznej).
  */
 async function getUserTime(userId, guildId) {
   try {
     let totalTime = 0;
-    let activeJoinTime = null;
 
     if (isPostgres && pgPool) {
-      // Pobierz zapisany czas
       const resTime = await pgPool.query(
         'SELECT total_time FROM user_times WHERE user_id = $1 AND guild_id = $2',
         [userId, guildId]
@@ -209,38 +445,19 @@ async function getUserTime(userId, guildId) {
       if (resTime.rows.length > 0) {
         totalTime = Number(resTime.rows[0].total_time);
       }
-
-      // Sprawdź, czy użytkownik jest obecnie na kanale
-      const resActive = await pgPool.query(
-        'SELECT join_time FROM active_sessions WHERE user_id = $1 AND guild_id = $2',
-        [userId, guildId]
-      );
-      if (resActive.rows.length > 0) {
-        activeJoinTime = Number(resActive.rows[0].join_time);
-      }
     } else if (dbSQLite) {
-      // Pobierz zapisany czas w SQLite
       const rowTime = await dbSQLite.get(
         'SELECT total_time FROM user_times WHERE user_id = ? AND guild_id = ?',
         [userId, guildId]
       );
       if (rowTime) {
-        totalTime = rowTime.total_time;
-      }
-
-      // Sprawdź aktywną sesję w SQLite
-      const rowActive = await dbSQLite.get(
-        'SELECT join_time FROM active_sessions WHERE user_id = ? AND guild_id = ?',
-        [userId, guildId]
-      );
-      if (rowActive) {
-        activeJoinTime = rowActive.join_time;
+        totalTime = Number(rowTime.total_time);
       }
     }
 
-    // Dodaj czas na żywo, jeśli użytkownik nadal rozmawia
-    if (activeJoinTime) {
-      totalTime += (Date.now() - activeJoinTime);
+    const activeSession = await getActiveSession(userId, guildId);
+    if (activeSession) {
+      totalTime += (Date.now() - activeSession.join_time);
     }
 
     return totalTime;
@@ -251,30 +468,289 @@ async function getUserTime(userId, guildId) {
 }
 
 /**
- * Pobiera listę liderów (najlepszych użytkowników) według spędzonego czasu.
+ * Pobiera czas użytkownika dla konkretnego okresu: 'today', 'week', 'month', 'all'
  */
-async function getLeaderboard(guildId, limit = 10) {
+async function getUserPeriodTime(userId, guildId, period = 'all') {
   try {
-    if (isPostgres && pgPool) {
-      const res = await pgPool.query(
-        'SELECT user_id, total_time FROM user_times WHERE guild_id = $1 ORDER BY total_time DESC LIMIT $2',
-        [guildId, limit]
-      );
-      return res.rows.map(row => ({
-        user_id: row.user_id,
-        total_time: Number(row.total_time)
-      }));
-    } else if (dbSQLite) {
-      const rows = await dbSQLite.all(
-        'SELECT user_id, total_time FROM user_times WHERE guild_id = ? ORDER BY total_time DESC LIMIT ?',
-        [guildId, limit]
-      );
-      return rows;
+    const activeSession = await getActiveSession(userId, guildId);
+    const activeBreakdown = getActiveSessionBreakdown(activeSession);
+
+    if (period === 'all') {
+      return await getUserTime(userId, guildId);
     }
-    return [];
+
+    const todayStr = getWarsawDateString();
+    const weekRange = getCurrentWeekRange();
+    const monthRange = getCurrentMonthRange();
+
+    let queryTime = 0;
+
+    if (isPostgres && pgPool) {
+      if (period === 'today') {
+        const res = await pgPool.query(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3',
+          [userId, guildId, todayStr]
+        );
+        queryTime = Number(res.rows[0]?.period_time || 0);
+        return queryTime + activeBreakdown.today;
+      } else if (period === 'week') {
+        const res = await pgPool.query(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4',
+          [userId, guildId, weekRange.startDate, weekRange.endDate]
+        );
+        queryTime = Number(res.rows[0]?.period_time || 0);
+        return queryTime + activeBreakdown.week;
+      } else if (period === 'month') {
+        const res = await pgPool.query(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4',
+          [userId, guildId, monthRange.startDate, monthRange.endDate]
+        );
+        queryTime = Number(res.rows[0]?.period_time || 0);
+        return queryTime + activeBreakdown.month;
+      }
+    } else if (dbSQLite) {
+      if (period === 'today') {
+        const row = await dbSQLite.get(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date = ?',
+          [userId, guildId, todayStr]
+        );
+        queryTime = Number(row?.period_time || 0);
+        return queryTime + activeBreakdown.today;
+      } else if (period === 'week') {
+        const row = await dbSQLite.get(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date >= ? AND date <= ?',
+          [userId, guildId, weekRange.startDate, weekRange.endDate]
+        );
+        queryTime = Number(row?.period_time || 0);
+        return queryTime + activeBreakdown.week;
+      } else if (period === 'month') {
+        const row = await dbSQLite.get(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date >= ? AND date <= ?',
+          [userId, guildId, monthRange.startDate, monthRange.endDate]
+        );
+        queryTime = Number(row?.period_time || 0);
+        return queryTime + activeBreakdown.month;
+      }
+    }
+
+    return 0;
+  } catch (error) {
+    console.error(`Błąd pobierania czasu okresowego (${period}) dla ${userId}:`, error);
+    return 0;
+  }
+}
+
+/**
+ * Pobiera pełne statystyki użytkownika (dzisiaj, tydzień, miesiąc, łącznie, aktywna sesja, pozycje w rankingach)
+ */
+async function getUserStats(userId, guildId) {
+  try {
+    const todayStr = getWarsawDateString();
+    const weekRange = getCurrentWeekRange();
+    const monthRange = getCurrentMonthRange();
+
+    let savedToday = 0;
+    let savedWeek = 0;
+    let savedMonth = 0;
+    let savedTotal = 0;
+
+    if (isPostgres && pgPool) {
+      const [resTotal, resToday, resWeek, resMonth] = await Promise.all([
+        pgPool.query('SELECT total_time FROM user_times WHERE user_id = $1 AND guild_id = $2', [userId, guildId]),
+        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3', [userId, guildId, todayStr]),
+        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, weekRange.startDate, weekRange.endDate]),
+        pgPool.query('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4', [userId, guildId, monthRange.startDate, monthRange.endDate]),
+      ]);
+
+      savedTotal = Number(resTotal.rows[0]?.total_time || 0);
+      savedToday = Number(resToday.rows[0]?.t || 0);
+      savedWeek = Number(resWeek.rows[0]?.t || 0);
+      savedMonth = Number(resMonth.rows[0]?.t || 0);
+    } else if (dbSQLite) {
+      const [rowTotal, rowToday, rowWeek, rowMonth] = await Promise.all([
+        dbSQLite.get('SELECT total_time FROM user_times WHERE user_id = ? AND guild_id = ?', [userId, guildId]),
+        dbSQLite.get('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date = ?', [userId, guildId, todayStr]),
+        dbSQLite.get('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date >= ? AND date <= ?', [userId, guildId, weekRange.startDate, weekRange.endDate]),
+        dbSQLite.get('SELECT SUM(time_spent) as t FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date >= ? AND date <= ?', [userId, guildId, monthRange.startDate, monthRange.endDate]),
+      ]);
+
+      savedTotal = Number(rowTotal?.total_time || 0);
+      savedToday = Number(rowToday?.t || 0);
+      savedWeek = Number(rowWeek?.t || 0);
+      savedMonth = Number(rowMonth?.t || 0);
+    }
+
+    const activeSession = await getActiveSession(userId, guildId);
+    const activeBreakdown = getActiveSessionBreakdown(activeSession);
+
+    const total = savedTotal + activeBreakdown.total;
+    const today = savedToday + activeBreakdown.today;
+    const week = savedWeek + activeBreakdown.week;
+    const month = savedMonth + activeBreakdown.month;
+
+    // Obliczamy pozycje w rankingu
+    const [rankTotal, rankToday, rankWeek, rankMonth] = await Promise.all([
+      getUserRank(userId, guildId, 'all'),
+      getUserRank(userId, guildId, 'today'),
+      getUserRank(userId, guildId, 'week'),
+      getUserRank(userId, guildId, 'month')
+    ]);
+
+    return {
+      today,
+      week,
+      month,
+      total,
+      activeSession,
+      ranks: {
+        total: rankTotal,
+        today: rankToday,
+        week: rankWeek,
+        month: rankMonth
+      }
+    };
+  } catch (error) {
+    console.error(`Błąd pobierania statystyk dla ${userId}:`, error);
+    return {
+      today: 0,
+      week: 0,
+      month: 0,
+      total: 0,
+      activeSession: null,
+      ranks: { total: null, today: null, week: null, month: null }
+    };
+  }
+}
+
+/**
+ * Oblicza pozycję użytkownika w rankingu (1-indexed) dla danego okresu.
+ */
+async function getUserRank(userId, guildId, period = 'all') {
+  try {
+    const list = await getAllUsersSorted(guildId, period);
+    const index = list.findIndex(item => item.user_id === userId);
+    return index !== -1 ? index + 1 : null;
+  } catch (error) {
+    console.error('Błąd getUserRank:', error);
+    return null;
+  }
+}
+
+/**
+ * Pomocnicza funkcja pobierająca zagregowaną i posortowaną listę użytkowników wraz z uwzględnieniem aktywnych sesji na żywo.
+ */
+async function getAllUsersSorted(guildId, period = 'all') {
+  const todayStr = getWarsawDateString();
+  const weekRange = getCurrentWeekRange();
+  const monthRange = getCurrentMonthRange();
+
+  let map = new Map(); // user_id -> time
+
+  if (isPostgres && pgPool) {
+    if (period === 'all') {
+      const res = await pgPool.query('SELECT user_id, total_time as time FROM user_times WHERE guild_id = $1', [guildId]);
+      for (const row of res.rows) {
+        map.set(row.user_id, Number(row.time));
+      }
+    } else {
+      let dateFilter = 'date = $2';
+      let params = [guildId, todayStr];
+      if (period === 'week') {
+        dateFilter = 'date >= $2 AND date <= $3';
+        params = [guildId, weekRange.startDate, weekRange.endDate];
+      } else if (period === 'month') {
+        dateFilter = 'date >= $2 AND date <= $3';
+        params = [guildId, monthRange.startDate, monthRange.endDate];
+      }
+      const res = await pgPool.query(
+        `SELECT user_id, SUM(time_spent) as time FROM user_daily_times WHERE guild_id = $1 AND ${dateFilter} GROUP BY user_id`,
+        params
+      );
+      for (const row of res.rows) {
+        map.set(row.user_id, Number(row.time));
+      }
+    }
+  } else if (dbSQLite) {
+    if (period === 'all') {
+      const rows = await dbSQLite.all('SELECT user_id, total_time as time FROM user_times WHERE guild_id = ?', [guildId]);
+      for (const row of rows) {
+        map.set(row.user_id, Number(row.time));
+      }
+    } else {
+      let dateFilter = 'date = ?';
+      let params = [guildId, todayStr];
+      if (period === 'week') {
+        dateFilter = 'date >= ? AND date <= ?';
+        params = [guildId, weekRange.startDate, weekRange.endDate];
+      } else if (period === 'month') {
+        dateFilter = 'date >= ? AND date <= ?';
+        params = [guildId, monthRange.startDate, monthRange.endDate];
+      }
+      const rows = await dbSQLite.all(
+        `SELECT user_id, SUM(time_spent) as time FROM user_daily_times WHERE guild_id = ? AND ${dateFilter} GROUP BY user_id`,
+        params
+      );
+      for (const row of rows) {
+        map.set(row.user_id, Number(row.time));
+      }
+    }
+  }
+
+  // Uwzględniamy aktywne sesje na żywo
+  let activeSessions = [];
+  if (isPostgres && pgPool) {
+    const res = await pgPool.query('SELECT user_id, join_time FROM active_sessions WHERE guild_id = $1', [guildId]);
+    activeSessions = res.rows;
+  } else if (dbSQLite) {
+    activeSessions = await dbSQLite.all('SELECT user_id, join_time FROM active_sessions WHERE guild_id = ?', [guildId]);
+  }
+
+  for (const s of activeSessions) {
+    const breakdown = getActiveSessionBreakdown({ join_time: Number(s.join_time) });
+    let additional = 0;
+    if (period === 'all') additional = breakdown.total;
+    else if (period === 'today') additional = breakdown.today;
+    else if (period === 'week') additional = breakdown.week;
+    else if (period === 'month') additional = breakdown.month;
+
+    if (additional > 0) {
+      const current = map.get(s.user_id) || 0;
+      map.set(s.user_id, current + additional);
+    }
+  }
+
+  const list = [];
+  for (const [userId, time] of map.entries()) {
+    if (time > 0) {
+      list.push({ user_id: userId, total_time: time });
+    }
+  }
+
+  // Sortowanie malejąco
+  list.sort((a, b) => b.total_time - a.total_time);
+  return list;
+}
+
+/**
+ * Pobiera ranking z paginacją oraz wsparciem dla okresów (all, today, week, month).
+ * @param {string} guildId 
+ * @param {number} limit Liczba wpisów na stronę (np. 10)
+ * @param {number} offset Od którego indeksu (np. 0 dla str. 1, 10 dla str. 2)
+ * @param {string} period 'all' | 'today' | 'week' | 'month'
+ */
+async function getLeaderboard(guildId, limit = 10, offset = 0, period = 'all') {
+  try {
+    const list = await getAllUsersSorted(guildId, period);
+    const paginated = list.slice(offset, offset + limit);
+    return {
+      entries: paginated,
+      totalCount: list.length,
+      page: Math.floor(offset / limit) + 1,
+      totalPages: Math.max(1, Math.ceil(list.length / limit))
+    };
   } catch (error) {
     console.error('Błąd pobierania rankingu:', error);
-    return [];
+    return { entries: [], totalCount: 0, page: 1, totalPages: 1 };
   }
 }
 
@@ -333,7 +809,14 @@ module.exports = {
   startVoiceSession,
   endVoiceSession,
   getUserTime,
+  getUserPeriodTime,
+  getUserStats,
+  getUserRank,
   getLeaderboard,
+  getActiveSession,
   incrementDeletedMessages,
-  getDeletedMessagesCount
+  getDeletedMessagesCount,
+  getWarsawDateString,
+  getCurrentWeekRange,
+  getCurrentMonthRange
 };

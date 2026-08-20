@@ -5,6 +5,9 @@ const {
   GatewayIntentBits, 
   ActivityType, 
   EmbedBuilder, 
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   PermissionFlagsBits, 
   ApplicationCommandOptionType,
   MessageFlags
@@ -44,6 +47,8 @@ const client = new Client({
 
 // Pomocnicza funkcja do formatowania czasu (ms -> tekst)
 function formatDuration(ms) {
+  if (!ms || ms <= 0) return '0 sek.';
+
   const seconds = Math.floor((ms / 1000) % 60);
   const minutes = Math.floor((ms / (1000 * 60)) % 60);
   const hours = Math.floor(ms / (1000 * 60 * 60));
@@ -66,12 +71,34 @@ function formatNumberShort(num) {
 
 // Krótkie formatowanie czasu na potrzeby statusu bota
 function formatDurationShort(ms) {
+  if (!ms || ms <= 0) return '0m';
   const hours = Math.floor(ms / (1000 * 60 * 60));
   const minutes = Math.floor((ms / (1000 * 60)) % 60);
   if (hours > 0) {
     return `${hours}h ${minutes}m`;
   }
   return `${minutes}m`;
+}
+
+// Generowanie estetycznego paska postępu
+function createProgressBar(value, max, length = 10) {
+  if (max <= 0) return '`[░░░░░░░░░░]` 0%';
+  const percentage = Math.min(100, Math.max(0, Math.round((value / max) * 100)));
+  const filledLength = Math.round((percentage / 100) * length);
+  const emptyLength = length - filledLength;
+  const bar = '█'.repeat(filledLength) + '░'.repeat(emptyLength);
+  return `\`[${bar}]\` **${percentage}%**`;
+}
+
+// Etykieta okresu
+function getPeriodLabel(period) {
+  switch (period) {
+    case 'today': return '📅 Dzisiaj';
+    case 'week': return '📆 Ten tydzień';
+    case 'month': return '🗓️ Ten miesiąc';
+    case 'all':
+    default: return '🏆 Łącznie (All-time)';
+  }
 }
 
 // Funkcja aktualizująca status bota (Usunięte wiadomości) w czasie rzeczywistym
@@ -83,12 +110,10 @@ async function updatePresence() {
       return;
     }
 
-    // Pobierz łączną liczbę usuniętych wiadomości i sformatuj (np. 1.2k)
     const deletedCount = await db.getDeletedMessagesCount();
     const formattedDeleted = formatNumberShort(deletedCount);
     const statusText = `🗑️ Usunięto: ${formattedDeleted}`;
 
-    // Ustawienie statusu bota (Custom Status)
     client.user.setPresence({
       activities: [{ 
         name: statusText,
@@ -98,7 +123,6 @@ async function updatePresence() {
       status: 'online',
     });
 
-    // Alternatywnie ustawiamy aktywność jako fallback
     client.user.setActivity(statusText, { type: ActivityType.Custom });
   } catch (error) {
     console.error('Błąd podczas aktualizowania obecności bota:', error);
@@ -111,10 +135,9 @@ async function updateApplicationBio() {
     const guildId = process.env.GUILD_ID;
     if (!guildId || guildId === 'twoje_guild_id_tutaj') return;
 
-    // Pobierz ranking 3 najlepszych użytkowników czasu głosowego
-    const leaderboard = await db.getLeaderboard(guildId, 3);
+    const leaderboardData = await db.getLeaderboard(guildId, 3, 0, 'all');
+    const leaderboard = leaderboardData.entries;
     
-    // Budujemy tekst opisu aplikacji (O mnie)
     const bioLines = ['🏆 Topka aktywności głosowej:'];
     if (leaderboard.length === 0) {
       bioLines.push('Brak danych o aktywności.');
@@ -138,13 +161,68 @@ async function updateApplicationBio() {
 
     const bioText = bioLines.join('\n');
     
-    // Aktualizujemy opis aplikacji (O mnie) bota
     if (client.application) {
       await client.application.edit({ description: bioText });
     }
   } catch (error) {
     console.error('Błąd podczas aktualizowania opisu bota (O mnie):', error.message);
   }
+}
+
+// Budowanie widoku rankingu (Embed + Przyciski nawigacji)
+async function buildLeaderboardView(guildId, period = 'all', page = 1) {
+  const limit = 10;
+  const targetPage = Math.max(1, page);
+  const offset = (targetPage - 1) * limit;
+
+  const result = await db.getLeaderboard(guildId, limit, offset, period);
+  const { entries, totalCount, totalPages } = result;
+  const actualPage = Math.min(targetPage, totalPages);
+
+  const periodLabel = getPeriodLabel(period);
+
+  const embed = new EmbedBuilder()
+    .setColor('#5865F2')
+    .setTitle(`🏆 Ranking aktywności na kanałach głosowych`)
+    .setDescription(`**Okres:** ${periodLabel}\n\n` + (entries.length === 0 
+      ? '*Brak danych o aktywności dla wybranego okresu.*'
+      : entries.map((row, index) => {
+          const rankNumber = offset + index + 1;
+          let rankBadge = `**#${rankNumber}**`;
+          if (rankNumber === 1) rankBadge = '🥇';
+          else if (rankNumber === 2) rankBadge = '🥈';
+          else if (rankNumber === 3) rankBadge = '🥉';
+
+          return `${rankBadge} <@${row.user_id}> — **${formatDuration(row.total_time)}**`;
+        }).join('\n\n')
+    ))
+    .setFooter({ 
+      text: `Strona ${actualPage} z ${totalPages} • Osób w rankingu: ${totalCount} • Ekipa Remontowa Bot` 
+    })
+    .setTimestamp();
+
+  // Przyciski nawigacji stron
+  const prevButton = new ButtonBuilder()
+    .setCustomId(`lb_prev_${period}_${actualPage}`)
+    .setLabel('◀ Poprzednia')
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(actualPage <= 1);
+
+  const pageIndicator = new ButtonBuilder()
+    .setCustomId(`lb_info_${period}_${actualPage}`)
+    .setLabel(`Strona ${actualPage} / ${totalPages}`)
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(true);
+
+  const nextButton = new ButtonBuilder()
+    .setCustomId(`lb_next_${period}_${actualPage}`)
+    .setLabel('Następna ▶')
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(actualPage >= totalPages);
+
+  const row = new ActionRowBuilder().addComponents(prevButton, pageIndicator, nextButton);
+
+  return { embeds: [embed], components: [row] };
 }
 
 // Obsługa uruchomienia bota
@@ -178,7 +256,7 @@ client.once('ready', async () => {
     }
   }
 
-  // Uruchomienie pętli aktualizujących (status co 15 sekund, "O mnie" co 30 sekund)
+  // Uruchomienie pętli aktualizujących
   updatePresence();
   updateApplicationBio();
   setInterval(updatePresence, 15000); // co 15 sekund
@@ -187,8 +265,68 @@ client.once('ready', async () => {
   // Definicja komend Slash
   const commands = [
     {
+      name: 'profile',
+      description: 'Pokazuje szczegółowy profil aktywności głosowej użytkownika (dzisiaj, tydzień, miesiąc, łącznie).',
+      options: [
+        {
+          name: 'uzytkownik',
+          type: ApplicationCommandOptionType.User,
+          description: 'Użytkownik, którego profil chcesz zobaczyć (domyślnie: Ty).',
+          required: false
+        }
+      ]
+    },
+    {
       name: 'time',
-      description: 'Pokazuje łączny czas spędzony na kanałach głosowych.',
+      description: 'Pokazuje czas spędzony na kanałach głosowych.',
+      options: [
+        {
+          name: 'uzytkownik',
+          type: ApplicationCommandOptionType.User,
+          description: 'Użytkownik, którego czas chcesz sprawdzić (opcjonalnie).',
+          required: false
+        },
+        {
+          name: 'okres',
+          type: ApplicationCommandOptionType.String,
+          description: 'Wybierz okres czasu (domyślnie: łącznie).',
+          required: false,
+          choices: [
+            { name: '🏆 Łącznie (All-time)', value: 'all' },
+            { name: '📅 Dzisiaj', value: 'today' },
+            { name: '📆 Ten tydzień', value: 'week' },
+            { name: '🗓️ Ten miesiąc', value: 'month' }
+          ]
+        }
+      ]
+    },
+    {
+      name: 'daily',
+      description: 'Pokazuje czas spędzony na kanałach głosowych w dniu dzisiejszym.',
+      options: [
+        {
+          name: 'uzytkownik',
+          type: ApplicationCommandOptionType.User,
+          description: 'Użytkownik, którego czas chcesz sprawdzić (opcjonalnie).',
+          required: false
+        }
+      ]
+    },
+    {
+      name: 'weekly',
+      description: 'Pokazuje czas spędzony na kanałach głosowych w bieżącym tygodniu.',
+      options: [
+        {
+          name: 'uzytkownik',
+          type: ApplicationCommandOptionType.User,
+          description: 'Użytkownik, którego czas chcesz sprawdzić (opcjonalnie).',
+          required: false
+        }
+      ]
+    },
+    {
+      name: 'monthly',
+      description: 'Pokazuje czas spędzony na kanałach głosowych w bieżącym miesiącu.',
       options: [
         {
           name: 'uzytkownik',
@@ -200,7 +338,28 @@ client.once('ready', async () => {
     },
     {
       name: 'leaderboard',
-      description: 'Pokazuje ranking użytkowników z największą ilością czasu na kanałach głosowych.'
+      description: 'Pokazuje ranking użytkowników z największą ilością czasu na kanałach głosowych.',
+      options: [
+        {
+          name: 'okres',
+          type: ApplicationCommandOptionType.String,
+          description: 'Wybierz okres rankingu (domyślnie: łącznie).',
+          required: false,
+          choices: [
+            { name: '🏆 Łącznie (All-time)', value: 'all' },
+            { name: '📅 Dzisiaj', value: 'today' },
+            { name: '📆 Ten tydzień', value: 'week' },
+            { name: '🗓️ Ten miesiąc', value: 'month' }
+          ]
+        },
+        {
+          name: 'strona',
+          type: ApplicationCommandOptionType.Integer,
+          description: 'Numer strony rankingu (np. 1, 2, 3...).',
+          required: false,
+          min_value: 1
+        }
+      ]
     },
     {
       name: 'clear',
@@ -262,12 +421,10 @@ client.once('ready', async () => {
   try {
     const guildId = process.env.GUILD_ID;
     if (guildId && guildId !== 'twoje_guild_id_tutaj') {
-      // Rejestracja natychmiastowa na konkretnym serwerze (dla celów testowych/szybkiego startu)
       const guild = await client.guilds.fetch(guildId);
       await guild.commands.set(commands);
       console.log(`Zarejestrowano komendy Slash lokalnie dla serwera: ${guild.name}`);
     } else {
-      // Rejestracja globalna (może zająć do godziny w Discordzie, ale jest zalecana na produkcji)
       await client.application.commands.set(commands);
       console.log('Zarejestrowano komendy Slash globalnie.');
     }
@@ -284,9 +441,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   const member = newState.member || oldState.member;
   if (!member || member.user.bot) return; // Ignorujemy boty
 
-  // Log debugowania - zakomentowany ze względu na spam w konsoli
-  // console.log(`[DEBUG Voice] Wykryto aktywność użytkownika ${member.user.tag}. Kanał Stary: ${oldState.channelId || 'Brak'}, Kanał Nowy: ${newState.channelId || 'Brak'}`);
-
   const userId = member.id;
   const guildId = newState.guild?.id || oldState.guild?.id;
 
@@ -296,8 +450,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
   if (joinedChannel) {
     // Użytkownik wszedł na kanał głosowy
-    await db.startVoiceSession(userId, guildId);
-    console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego.`);
+    await db.startVoiceSession(userId, guildId, newState.channelId);
+    console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
   } else if (leftChannel) {
     // Użytkownik wyszedł z kanału głosowego
     await db.endVoiceSession(userId, guildId);
@@ -305,68 +459,223 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   } else if (switchedChannel) {
     // Użytkownik zmienił kanał
     await db.endVoiceSession(userId, guildId);
-    await db.startVoiceSession(userId, guildId);
-    console.log(`[Voice] ${member.user.tag} zmienił kanał głosowy.`);
+    await db.startVoiceSession(userId, guildId, newState.channelId);
+    console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
   }
 });
 
-// --- OBSŁUGA INTERAKCJI (KOMEND SLASH) ---
+// --- OBSŁUGA INTERAKCJI (KOMEND SLASH I PRZYCISKÓW) ---
 client.on('interactionCreate', async (interaction) => {
+  // 1. OBSŁUGA PRZYCISKÓW PAGINACJI LEADERBOARD
+  if (interaction.isButton()) {
+    const { customId, guildId } = interaction;
+    if (customId.startsWith('lb_prev_') || customId.startsWith('lb_next_')) {
+      const parts = customId.split('_'); // ['lb', 'prev'/'next', period, page]
+      const direction = parts[1];
+      const period = parts[2];
+      let currentPage = parseInt(parts[3], 10) || 1;
+
+      const newPage = direction === 'prev' ? Math.max(1, currentPage - 1) : currentPage + 1;
+      const view = await buildLeaderboardView(guildId, period, newPage);
+
+      return interaction.update(view);
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName, options, guildId, user } = interaction;
 
+  // --- KOMENDA /profile ---
+  if (commandName === 'profile') {
+    await interaction.deferReply();
+
+    const targetUser = options.getUser('uzytkownik') || user;
+    const member = interaction.guild?.members.cache.get(targetUser.id) || await interaction.guild?.members.fetch(targetUser.id).catch(() => null);
+    
+    const stats = await db.getUserStats(targetUser.id, guildId);
+
+    // Formatowanie statusu kanału głosowego
+    let voiceStatus = '⚪ **Status:** Poza kanałem głosowym';
+    if (stats.activeSession) {
+      const channelMention = stats.activeSession.channel_id ? `<#${stats.activeSession.channel_id}>` : 'kanał głosowy';
+      const joinUnix = Math.floor(stats.activeSession.join_time / 1000);
+      voiceStatus = `🟢 **Status:** Na kanale ${channelMention} (od <t:${joinUnix}:R>)`;
+    }
+
+    const formatRank = (r) => (r ? `#${r}` : '-');
+
+    const embed = new EmbedBuilder()
+      .setColor(member?.displayHexColor && member.displayHexColor !== '#000000' ? member.displayHexColor : '#5865F2')
+      .setAuthor({ 
+        name: `Profil Aktywności: ${targetUser.username}`, 
+        iconURL: targetUser.displayAvatarURL({ dynamic: true }) 
+      })
+      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true, size: 256 }))
+      .setDescription(
+        `${voiceStatus}\n\n` +
+        `📊 **Statystyki czasu spędzonego na rozmowach:**`
+      )
+      .addFields(
+        {
+          name: '📅 Dzisiaj',
+          value: `⏱️ **${formatDuration(stats.today)}**\n🏆 Pozycja: **${formatRank(stats.ranks.today)}**`,
+          inline: true
+        },
+        {
+          name: '📆 Ten tydzień',
+          value: `⏱️ **${formatDuration(stats.week)}**\n🏆 Pozycja: **${formatRank(stats.ranks.week)}**`,
+          inline: true
+        },
+        {
+          name: '🗓️ Ten miesiąc',
+          value: `⏱️ **${formatDuration(stats.month)}**\n🏆 Pozycja: **${formatRank(stats.ranks.month)}**`,
+          inline: true
+        },
+        {
+          name: '🏆 Łącznie (All-time)',
+          value: `⏱️ **${formatDuration(stats.total)}**\n🥇 Pozycja w rankingu: **${formatRank(stats.ranks.total)}**`,
+          inline: false
+        }
+      )
+      .setFooter({ text: 'Ekipa Remontowa Bot • Strefa czasowa: Europe/Warsaw' })
+      .setTimestamp();
+
+    if (member?.joinedTimestamp) {
+      const joinedUnix = Math.floor(member.joinedTimestamp / 1000);
+      embed.addFields({
+        name: '🛡️ Informacje o użytkowniku',
+        value: `Dołączył(a) na serwer: <t:${joinedUnix}:D> (<t:${joinedUnix}:R>)`,
+        inline: false
+      });
+    }
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // --- KOMENDA /time ---
   if (commandName === 'time') {
     await interaction.deferReply();
 
     const targetUser = options.getUser('uzytkownik') || user;
-    const timeMs = await db.getUserTime(targetUser.id, guildId);
+    const period = options.getString('okres') || 'all';
+    
+    if (period === 'all') {
+      const stats = await db.getUserStats(targetUser.id, guildId);
+      const embed = new EmbedBuilder()
+        .setColor('#43b581')
+        .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setDescription(
+          `⏱️ **Łączny czas:** \`${formatDuration(stats.total)}\`\n\n` +
+          `📅 **Dzisiaj:** ${formatDuration(stats.today)}\n` +
+          `📆 **Ten tydzień:** ${formatDuration(stats.week)}\n` +
+          `🗓️ **Ten miesiąc:** ${formatDuration(stats.month)}`
+        )
+        .setFooter({ text: 'Użyj /profile aby zobaczyć pozycję w rankingu.' })
+        .setTimestamp();
 
-    const embed = new EmbedBuilder()
-      .setColor('#43b581')
-      .setTitle(`🎙️ Czas na kanałach głosowych`)
-      .setDescription(`Użytkownik **${targetUser.username}** spędził łącznie:\n` + '```ansi\n\u001b[1;36m' + formatDuration(timeMs) + '\u001b[0m\n```')
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-      .setTimestamp();
+      return interaction.editReply({ embeds: [embed] });
+    } else {
+      const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, period);
+      const rank = await db.getUserRank(targetUser.id, guildId, period);
+      const periodLabel = getPeriodLabel(period);
 
-    await interaction.editReply({ embeds: [embed] });
+      const embed = new EmbedBuilder()
+        .setColor('#43b581')
+        .setTitle(`🎙️ Czas na kanałach głosowych — ${targetUser.username}`)
+        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+        .setDescription(
+          `**Okres:** ${periodLabel}\n\n` +
+          `⏱️ **Spędzony czas:**\n` +
+          '```ansi\n\u001b[1;36m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+          (rank ? `🏆 **Pozycja w rankingu:** #${rank}` : '')
+        )
+        .setTimestamp();
+
+      return interaction.editReply({ embeds: [embed] });
+    }
   }
 
+  // --- DEDYKOWANA KOMENDA /daily ---
+  if (commandName === 'daily') {
+    await interaction.deferReply();
+    const targetUser = options.getUser('uzytkownik') || user;
+    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'today');
+    const rank = await db.getUserRank(targetUser.id, guildId, 'today');
+
+    const embed = new EmbedBuilder()
+      .setColor('#faa61a')
+      .setTitle(`📅 Czas dzisiejszy — ${targetUser.username}`)
+      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+      .setDescription(
+        `Spędzony czas dzisiaj:\n` +
+        '```ansi\n\u001b[1;33m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+        `🏆 **Pozycja w dzisiejszym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+      )
+      .setFooter({ text: 'Ekipa Remontowa Bot' })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // --- DEDYKOWANA KOMENDA /weekly ---
+  if (commandName === 'weekly') {
+    await interaction.deferReply();
+    const targetUser = options.getUser('uzytkownik') || user;
+    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'week');
+    const rank = await db.getUserRank(targetUser.id, guildId, 'week');
+
+    const embed = new EmbedBuilder()
+      .setColor('#7289da')
+      .setTitle(`📆 Czas tygodniowy — ${targetUser.username}`)
+      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+      .setDescription(
+        `Spędzony czas w bieżącym tygodniu (od poniedziałku):\n` +
+        '```ansi\n\u001b[1;34m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+        `🏆 **Pozycja w tygodniowym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+      )
+      .setFooter({ text: 'Ekipa Remontowa Bot' })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // --- DEDYKOWANA KOMENDA /monthly ---
+  if (commandName === 'monthly') {
+    await interaction.deferReply();
+    const targetUser = options.getUser('uzytkownik') || user;
+    const timeMs = await db.getUserPeriodTime(targetUser.id, guildId, 'month');
+    const rank = await db.getUserRank(targetUser.id, guildId, 'month');
+
+    const embed = new EmbedBuilder()
+      .setColor('#eb459e')
+      .setTitle(`🗓️ Czas miesięczny — ${targetUser.username}`)
+      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+      .setDescription(
+        `Spędzony czas w bieżącym miesiącu:\n` +
+        '```ansi\n\u001b[1;35m' + formatDuration(timeMs) + '\u001b[0m\n```' +
+        `🏆 **Pozycja w miesięcznym rankingu:** ${rank ? `#${rank}` : 'Brak danych'}`
+      )
+      .setFooter({ text: 'Ekipa Remontowa Bot' })
+      .setTimestamp();
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // --- KOMENDA /leaderboard (Z PAGINACJĄ I OKRESAMI) ---
   if (commandName === 'leaderboard') {
     await interaction.deferReply();
 
-    const leaderboard = await db.getLeaderboard(guildId, 10);
-    if (leaderboard.length === 0) {
-      return interaction.editReply('Brak danych o aktywności głosowej na tym serwerze.');
-    }
+    const period = options.getString('okres') || 'all';
+    const page = options.getInteger('strona') || 1;
 
-    let description = '';
-    for (let i = 0; i < leaderboard.length; i++) {
-      const row = leaderboard[i];
-      let userTag = `<@${row.user_id}>`;
-      
-      // Dodatkowe formatowanie dla top 3
-      let medal = '';
-      if (i === 0) medal = '🥇 ';
-      else if (i === 1) medal = '🥈 ';
-      else if (i === 2) medal = '🥉 ';
-      else medal = `${i + 1}. `;
-
-      description += `${medal}${userTag}: **${formatDuration(row.total_time)}**\n`;
-    }
-
-    const embed = new EmbedBuilder()
-      .setColor('#5865F2')
-      .setTitle('🏆 Ranking aktywności na kanałach głosowych')
-      .setDescription(description)
-      .setTimestamp()
-      .setFooter({ text: 'Ekipa Remontowa Bot' });
-
-    await interaction.editReply({ embeds: [embed] });
+    const view = await buildLeaderboardView(guildId, period, page);
+    return interaction.editReply(view);
   }
 
   // --- POMOCNICZE METODY DO CZYSZENIA WIADOMOŚCI ---
-  // Pobieranie wielu wiadomości w pętli (ponieważ pojedyncze zapytanie ma limit 100)
   async function fetchManyMessages(channel, limit) {
     let allMessages = [];
     let lastId = null;
@@ -384,14 +693,12 @@ client.on('interactionCreate', async (interaction) => {
       allMessages.push(...fetched.values());
       lastId = fetched.last().id;
       
-      // Małe opóźnienie, aby nie przeciążyć API
       await new Promise(resolve => setTimeout(resolve, 200));
     }
     
     return allMessages;
   }
 
-  // Dzielenie tablicy na mniejsze kawałki
   function chunkArray(array, size) {
     const chunks = [];
     for (let i = 0; i < array.length; i += size) {
@@ -401,7 +708,6 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (commandName === 'clear') {
-    // Sprawdzenie uprawnień (chociaż Discord.js v14 i tak filtruje to na poziomie interfejsu)
     if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
       return interaction.reply({ 
         content: 'Nie masz uprawnień do zarządzania wiadomościami.', 
@@ -417,32 +723,27 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const amount = options.getInteger('ilosc');
-    const deleteOld = options.getBoolean('usun_bardzo_stare') !== false; // Domyślnie: true (Tak)
-    const delaySeconds = options.getInteger('opoznienie_sekundy') || 2; // Domyślnie 2 sekundy
+    const deleteOld = options.getBoolean('usun_bardzo_stare') !== false;
+    const delaySeconds = options.getInteger('opoznienie_sekundy') || 2;
     const olderThanMinutes = options.getInteger('starsze_niz_minuty');
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
-    // Oznaczamy kanał jako aktywny w procesie czyszczenia
     activeClearChannels.add(interaction.channelId);
 
     try {
-      // Pobieramy nieco większą pulę wiadomości, aby móc wybrać najstarsze spełniające kryteria
       const fetchLimit = Math.max(100, amount);
       await interaction.editReply(`Pobieranie wiadomości z kanału (skanowanie ostatnich ${fetchLimit})...`);
       
       let messages = await fetchManyMessages(interaction.channel, fetchLimit);
       const now = Date.now();
 
-      // Filtrowanie wiadomości według starsze_niz_minuty, jeśli podano
       if (olderThanMinutes !== null && olderThanMinutes !== undefined) {
         const minAgeMs = olderThanMinutes * 60 * 1000;
         messages = messages.filter(msg => (now - msg.createdAt.getTime()) > minAgeMs);
       }
 
-      // Sortujemy wiadomości od najstarszych do najnowszych (najstarsze najpierw)
       messages.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
-      // Wybieramy dokładnie tyle najstarszych wiadomości, ile zażądał użytkownik
       const messagesToDelete = messages.slice(0, amount);
       const totalMessagesToProcess = messagesToDelete.length;
 
@@ -451,7 +752,6 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply('Nie znaleziono wiadomości spełniających Twoje kryteria do usunięcia na tym kanale.');
       }
 
-      // Filtrujemy wiadomości młodsze niż 14 dni do szybkiego usunięcia
       const youngMessages = messagesToDelete.filter(msg => {
         const age = now - msg.createdAt.getTime();
         return age < 14 * 24 * 60 * 60 * 1000 && !msg.pinned;
@@ -472,7 +772,6 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      // Filtrujemy wiadomości starsze niż 14 dni
       const oldMessages = messagesToDelete.filter(msg => {
         const age = now - msg.createdAt.getTime();
         const isAlreadyDeleted = youngMessages.some(ym => ym.id === msg.id);
@@ -483,7 +782,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply(`Pomyślnie usunięto **${totalDeleted}** wiadomości. Rozpoczynam powolne usuwanie **${oldMessages.length}** wiadomości starszych niż 14 dni z opóźnieniem **${delaySeconds} sek.** między każdą z nich...`);
         
         for (const msg of oldMessages) {
-          // Sprawdzamy czy nie zatrzymano procesu
           if (!activeClearChannels.has(interaction.channelId)) {
             break;
           }
@@ -504,7 +802,6 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      // Zapisujemy usunięte wiadomości w statystykach bazy danych
       if (totalDeleted > 0) {
         await db.incrementDeletedMessages(totalDeleted);
       }
@@ -524,7 +821,6 @@ client.on('interactionCreate', async (interaction) => {
       console.error('Błąd podczas usuwania wiadomości:', error);
       await interaction.editReply({ content: 'Wystąpił błąd podczas usuwania wiadomości. Upewnij się, że bot ma odpowiednie uprawnienia.', embeds: [] });
     } finally {
-      // Usuwamy kanał z aktywnych
       activeClearChannels.delete(interaction.channelId);
     }
   }
@@ -597,10 +893,8 @@ function startAutoCleanLoop() {
 
   console.log(`[AutoClean] Uruchomiono inteligentne czyszczenie kanału ${cleanChannelId}. Czas życia wiadomości: ${lifetimeMinutes} min.`);
 
-  // Pierwsze sprawdzenie przy starcie bota (z opóźnieniem 10s, aby bot zdążył się w pełni połączyć)
   setTimeout(() => cleanChannel(cleanChannelId, lifetimeMinutes), 10000);
 
-  // Zapasowe sprawdzanie co 15 minut (jako fallback zabezpieczający)
   setInterval(() => {
     cleanChannel(cleanChannelId, lifetimeMinutes);
   }, 15 * 60 * 1000);
@@ -608,7 +902,6 @@ function startAutoCleanLoop() {
 
 async function cleanChannel(channelId, lifetimeMinutes) {
   if (isCleanChannelRunning) {
-    // Jeśli proces już trwa, ustawiamy flagę ponownego wykonania po jego zakończeniu
     shouldReRunClean = true;
     return;
   }
@@ -624,20 +917,15 @@ async function cleanChannel(channelId, lifetimeMinutes) {
       return;
     }
 
-    // Pobierz ostatnie 100 wiadomości
     const messages = await channel.messages.fetch({ limit: 100 });
     const now = Date.now();
     const lifetimeMs = lifetimeMinutes * 60 * 1000;
     const keepCount = parseInt(process.env.KEEP_NEWEST_COUNT || '3', 10);
     const delaySeconds = parseInt(process.env.AUTOCLEAN_DELAY_SECONDS || '2', 10);
 
-    // Sortujemy pobrane wiadomości od najnowszych do najstarszych (najnowsze na początku)
     const sortedMessages = [...messages.values()].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-
-    // Pomijamy pierwsze keepCount najnowszych wiadomości
     const candidateMessages = sortedMessages.slice(keepCount);
 
-    // Dzielimy wiadomości na te do usunięcia natychmiast oraz te do zaplanowania na później
     const toDeleteNow = [];
     const toDeleteLater = [];
 
@@ -660,7 +948,6 @@ async function cleanChannel(channelId, lifetimeMinutes) {
         try {
           await msg.delete();
           deletedCount++;
-          // Opóźnienie między usunięciem kolejnej wiadomości
           await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
         } catch (err) {
           if (err.code === 10008 || err.message.includes('Unknown Message')) {
@@ -683,13 +970,11 @@ async function cleanChannel(channelId, lifetimeMinutes) {
     }
 
     if (toDeleteLater.length > 0) {
-      // Sortujemy od najstarszych do najnowszych (najstarsza z nich wygaśnie jako pierwsza)
       toDeleteLater.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
       const oldestMsg = toDeleteLater[0];
       const age = now - oldestMsg.createdAt.getTime();
       const remainingMs = lifetimeMs - age;
 
-      // Planujemy kolejne sprawdzenie dokładnie na moment wygaśnięcia tej wiadomości (+ zapas 1.5 sekundy)
       const nextRunMs = Math.max(1000, remainingMs + 1500);
       autoCleanTimeout = setTimeout(() => cleanChannel(channelId, lifetimeMinutes), nextRunMs);
     }
@@ -699,7 +984,6 @@ async function cleanChannel(channelId, lifetimeMinutes) {
     isCleanChannelRunning = false;
     if (shouldReRunClean) {
       shouldReRunClean = false;
-      // Jeśli w międzyczasie pojawiły się nowe wiadomości, uruchom ponownie sprawdzanie za sekundę
       setTimeout(() => cleanChannel(channelId, lifetimeMinutes), 1000);
     }
   }
