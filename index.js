@@ -721,7 +721,7 @@ async function syncRoomPermissions(channel, room) {
       deny: everyoneDeny
     });
 
-    // Uprawnienia Gospodarza (Właściciela) - tylko sterowanie panelem, bez pisania
+    // Uprawnienia Gospodarza (Właściciela)
     if (room.ownerId) {
       overwrites.push({
         id: room.ownerId,
@@ -732,12 +732,10 @@ async function syncRoomPermissions(channel, room) {
           PermissionFlagsBits.MoveMembers,
           PermissionFlagsBits.MuteMembers,
           PermissionFlagsBits.DeafenMembers,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.EmbedLinks
-        ],
-        deny: [
           PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.SendMessagesInThreads
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.AttachFiles
         ]
       });
     }
@@ -748,12 +746,10 @@ async function syncRoomPermissions(channel, room) {
       const allowPerms = [
         PermissionFlagsBits.ViewChannel, 
         PermissionFlagsBits.Connect,
+        PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory
       ];
-      const denyPerms = [
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.SendMessagesInThreads
-      ];
+      const denyPerms = [];
 
       if (room.isMutedGuests) {
         denyPerms.push(PermissionFlagsBits.Speak);
@@ -1425,6 +1421,19 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     await handleManagedVoiceStateUpdate(oldState, newState);
   } catch (err) {
     console.error('Błąd w zdarzeniu voiceStateUpdate:', err.message);
+  }
+});
+
+// Automatyczne usuwanie wiadomości tekstowych użytkowników na czacie kanału zarządzanego (czat tylko dla panelu)
+client.on('messageCreate', async (message) => {
+  try {
+    if (message.author.bot) return;
+    const managedIds = getManagedVoiceChannelIds();
+    if (managedIds.includes(message.channelId)) {
+      await message.delete().catch(() => null);
+    }
+  } catch (err) {
+    // Ignoruj błędy
   }
 });
 
