@@ -775,6 +775,14 @@ async function syncRoomPermissions(channel, room) {
   }
 }
 
+// Bezpieczna zmiana nazwy kanału bez blokowania pętli zdarzeń przy rate-limicie Discorda
+function safeRenameChannel(channel, targetName) {
+  if (!channel || channel.name === targetName) return;
+  channel.edit({ name: targetName }).catch(err => {
+    console.warn(`[ManagedVoice] Discord rate limit dla nazwy kanału #${channel.name}: ${err.message}`);
+  });
+}
+
 // Przejęcie kanału przez pierwszego użytkownika
 async function claimRoom(channel, member) {
   // Weryfikacja: upewnij się, że użytkownik jest fizycznie połączony z tym kanałem
@@ -786,7 +794,6 @@ async function claimRoom(channel, member) {
     }
     return;
   }
-
 
   const room = getOrCreateRoom(channel);
   room.ownerId = member.id;
@@ -802,13 +809,16 @@ async function claimRoom(channel, member) {
 
   const targetName = `🔒 Kanał: ${member.displayName}`;
 
+  // 1. Zsynchronizuj uprawnienia i status (natychmiast)
   await Promise.allSettled([
-    channel.edit({ name: targetName }),
     setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
 
-  // Wysłanie nowego panelu na czat głosowy
+  // 2. Bezpieczna zmiana nazwy w tle
+  safeRenameChannel(channel, targetName);
+
+  // 3. Wysłanie nowego panelu na czat głosowy
   try {
     const panelPayload = buildRoomControlPanel(room, member, channel);
     const msg = await channel.send({
@@ -835,10 +845,11 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
   await newOwnerMember.voice.setMute(false).catch(() => null);
 
   await Promise.allSettled([
-    channel.edit({ name: targetName }),
     setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
+
+  safeRenameChannel(channel, targetName);
 
   // Odświeżenie istniejącego panelu lub wysłanie nowego
   try {
@@ -858,14 +869,12 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
   }
 }
 
-// Resetowanie kanału do stanu wyjściowego z blokadą wejścia na czas czyszczenia
+// Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
-  if (room.isResetting) return;
-  room.isResetting = true;
   room.ownerId = null;
   room.isPrivate = false;
-  room.isLocked = true;
+  room.isLocked = false;
   room.userLimit = 0;
   room.isMutedGuests = false;
   room.allowedUserIds.clear();
@@ -874,84 +883,51 @@ async function resetManagedRoom(channel) {
   room.panelMessageId = null;
 
   const defaultName = '🔊 Zamów prywatny kanał 🔏';
-  console.log(`[ManagedVoice] 🔒 Blokowanie kanału #${channel.name} i resetowanie do stanu początkowego...`);
+  console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
 
-  try {
-    // Krok 1: Natychmiastowe zablokowanie wejścia (@everyone: deny Connect) na czas czyszczenia
-    await channel.permissionOverwrites.set([
-      {
-        id: channel.guild.roles.everyone.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-        deny: [PermissionFlagsBits.Connect] // ZABLOKOWANE WEJŚCIE PODCZAS RESETU
-      },
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect,
-          PermissionFlagsBits.Speak,
-          PermissionFlagsBits.ManageChannels,
-          PermissionFlagsBits.ManageRoles,
-          PermissionFlagsBits.MoveMembers,
-          PermissionFlagsBits.MuteMembers,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.EmbedLinks
-        ],
-        deny: []
-      }
-    ]).catch(() => null);
+  // 1. Zawsze natychmiast odblokuj i zresetuj uprawnienia dla @everyone i bota
+  await channel.permissionOverwrites.set([
+    {
+      id: channel.guild.roles.everyone.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel, 
+        PermissionFlagsBits.Connect, 
+        PermissionFlagsBits.Speak, 
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.SendMessages
+      ],
+      deny: []
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.Speak,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ManageRoles,
+        PermissionFlagsBits.MoveMembers,
+        PermissionFlagsBits.MuteMembers,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.EmbedLinks
+      ],
+      deny: []
+    }
+  ]).catch(() => null);
 
-    // Krok 2: Wyczyszczenie czatu, przywrócenie nazwy domyślnej i wyzerowanie statusu
-    await Promise.allSettled([
-      channel.edit({ 
-        name: defaultName, 
-        userLimit: 0 
-      }).catch(() => null),
-      setVoiceChannelStatus(channel, null),
-      cleanChannelChat(channel)
-    ]);
+  // 2. Skasuj status głosowy i wyczyść czat
+  await Promise.allSettled([
+    setVoiceChannelStatus(channel, null),
+    cleanChannelChat(channel)
+  ]);
 
-    // Krok 3: Po zakończeniu czyszczenia odblokowanie wejścia dla każdego
-    await channel.permissionOverwrites.set([
-      {
-        id: channel.guild.roles.everyone.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel, 
-          PermissionFlagsBits.Connect, 
-          PermissionFlagsBits.Speak,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.SendMessages
-        ],
-        deny: []
-      },
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect,
-          PermissionFlagsBits.Speak,
-          PermissionFlagsBits.ManageChannels,
-          PermissionFlagsBits.ManageRoles,
-          PermissionFlagsBits.MoveMembers,
-          PermissionFlagsBits.MuteMembers,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.EmbedLinks
-        ],
-        deny: []
-      }
-    ]).catch(() => null);
+  // 3. Bezpieczna zmiana nazwy w tle (bez blokowania wątku)
+  safeRenameChannel(channel, defaultName);
 
-    room.isLocked = false;
-    room.isResetting = false;
-    console.log(`[ManagedVoice] ✅ Reset zakończony. Kanał #${defaultName} został odblokowany i jest gotowy do użytku.`);
-  } catch (err) {
-    room.isLocked = false;
-    room.isResetting = false;
-    console.error('[ManagedVoice] Błąd podczas resetu kanału:', err);
-  }
+  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został pomyślnie zresetowany i jest w 100% gotowy do użycia.`);
 }
+
 
 // Inicjalizacja zarządzanych kanałów przy starcie bota
 async function initManagedVoiceChannels(guild) {
