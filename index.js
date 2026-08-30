@@ -861,7 +861,7 @@ async function resetManagedRoom(channel) {
   // Równoległe wykonanie wszystkich operacji czyszczących (szybkość 50%+ wyższa)
   await Promise.allSettled([
     channel.edit({ 
-      name: room.defaultName || '🔊 Pokój Prywatny', 
+      name: room.defaultName || '🔊 Zamów prywatny kanał 🔏', 
       userLimit: 0 
     }).catch(() => null),
     setVoiceChannelStatus(channel, ''),
@@ -872,14 +872,10 @@ async function resetManagedRoom(channel) {
           PermissionFlagsBits.ViewChannel, 
           PermissionFlagsBits.Connect, 
           PermissionFlagsBits.Speak,
-          PermissionFlagsBits.ReadMessageHistory
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.SendMessages
         ],
-        deny: [
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.SendMessagesInThreads,
-          PermissionFlagsBits.CreatePublicThreads,
-          PermissionFlagsBits.CreatePrivateThreads
-        ]
+        deny: []
       },
       {
         id: client.user.id,
@@ -894,7 +890,8 @@ async function resetManagedRoom(channel) {
           PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.ReadMessageHistory,
           PermissionFlagsBits.EmbedLinks
-        ]
+        ],
+        deny: []
       }
     ]).catch(() => null),
     cleanChannelChat(channel)
@@ -912,7 +909,9 @@ async function initManagedVoiceChannels(guild) {
       const channel = await guild.channels.fetch(chanId).catch(() => null);
       if (channel && channel.isVoiceBased()) {
         const room = getOrCreateRoom(channel);
-        room.defaultName = channel.name;
+        if (!room.defaultName || room.defaultName.startsWith('🔒')) {
+          room.defaultName = '🔊 Zamów prywatny kanał 🔏';
+        }
 
         const nonBots = channel.members.filter(m => !m.user.bot);
         if (nonBots.size === 0) {
@@ -954,15 +953,16 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
     // 1. Użytkownik wszedł na zarządzany kanał
     if (isNewManaged && oldChannelId !== newChannelId) {
-      const channel = newState.channel;
+      const channel = newState.channel || await client.channels.fetch(newChannelId).catch(() => null);
       if (channel) {
         const room = getOrCreateRoom(channel);
         const nonBotMembers = channel.members.filter(m => !m.user.bot);
 
+        console.log(`[ManagedVoice] ${member.user.tag} wszedł na kanał #${channel.name}. Liczba osób: ${nonBotMembers.size}, Aktualny gospodarz: ${room.ownerId}`);
+
         if (!room.ownerId || nonBotMembers.size <= 1) {
           await claimRoom(channel, member);
         } else {
-          // Jeśli ktoś dołączył do aktywnego pokoju i włączone jest wyciszenie gości -> wycisz go na serwerze!
           if (room.isMutedGuests && member.id !== room.ownerId) {
             await member.voice.setMute(true).catch(() => null);
           }
@@ -977,8 +977,10 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
       const channel = oldState.channel || await client.channels.fetch(oldChannelId).catch(() => null);
       if (channel) {
         const room = getOrCreateRoom(channel);
-        // Kluczowe: wykluczamy użytkownika, który WŁAŚNIE OPUŚCIŁ kanał (discord.js cache może go jeszcze trzymać)
+        // Kluczowe: wykluczamy użytkownika, który WŁAŚNIE OPUŚCIŁ kanał
         const remainingNonBots = channel.members.filter(m => !m.user.bot && m.id !== member.id);
+
+        console.log(`[ManagedVoice] ${member.user.tag} opuścił kanał #${channel.name}. Pozostało osób: ${remainingNonBots.size}`);
 
         if (remainingNonBots.size === 0) {
           await resetManagedRoom(channel);
@@ -997,6 +999,7 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
     console.error('[ManagedVoice] Błąd w handleManagedVoiceStateUpdate:', err.message);
   }
 }
+
 
 
 // Obsługa interakcji z panelem prywatnego pokoju (Przyciski, Modale, Menu wyboru)
