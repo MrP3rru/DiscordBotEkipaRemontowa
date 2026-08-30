@@ -685,16 +685,18 @@ async function syncRoomPermissions(channel, room) {
       ]
     });
 
-    // Uprawnienia dla @everyone
+    // Uprawnienia dla @everyone (brak podglądu czatu panelu dla gości)
     const everyoneAllow = [];
-    const everyoneDeny = [];
+    const everyoneDeny = [
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.SendMessages
+    ];
 
     if (room.isPrivate) {
       everyoneDeny.push(PermissionFlagsBits.ViewChannel);
       everyoneDeny.push(PermissionFlagsBits.Connect);
     } else {
       everyoneAllow.push(PermissionFlagsBits.ViewChannel);
-      everyoneAllow.push(PermissionFlagsBits.ReadMessageHistory);
       if (room.isLocked) {
         everyoneDeny.push(PermissionFlagsBits.Connect);
       } else {
@@ -713,7 +715,7 @@ async function syncRoomPermissions(channel, room) {
       deny: everyoneDeny
     });
 
-    // Uprawnienia Gospodarza (Właściciela)
+    // Uprawnienia Gospodarza (Właściciela) - pełny dostęp do pokoju i czatu panelu
     if (room.ownerId) {
       overwrites.push({
         id: room.ownerId,
@@ -732,16 +734,17 @@ async function syncRoomPermissions(channel, room) {
       });
     }
 
-    // Uprawnienia dla zaproszonych użytkowników (Biała lista)
+    // Uprawnienia dla zaproszonych gości (Biała lista - mogą rozmawiać, ale nie widzą czatu panelu)
     for (const userId of room.allowedUserIds) {
       if (userId === room.ownerId) continue;
       const allowPerms = [
         PermissionFlagsBits.ViewChannel, 
-        PermissionFlagsBits.Connect,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory
+        PermissionFlagsBits.Connect
       ];
-      const denyPerms = [];
+      const denyPerms = [
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.SendMessages
+      ];
 
       if (room.isMutedGuests) {
         denyPerms.push(PermissionFlagsBits.Speak);
@@ -764,7 +767,8 @@ async function syncRoomPermissions(channel, room) {
         deny: [
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.Connect,
-          PermissionFlagsBits.SendMessages
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory
         ]
       });
     }
@@ -776,6 +780,7 @@ async function syncRoomPermissions(channel, room) {
 }
 
 // Przejęcie kanału przez pierwszego użytkownika
+
 async function claimRoom(channel, member) {
   const room = getOrCreateRoom(channel);
   room.ownerId = member.id;
