@@ -843,12 +843,12 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
 }
 
 
-// Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
+// Resetowanie kanału do stanu wyjściowego z animacją i chwilową blokadą
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
   room.ownerId = null;
   room.isPrivate = false;
-  room.isLocked = false;
+  room.isLocked = true; // Chwilowa blokada w pamięci
   room.userLimit = 0;
   room.isMutedGuests = false;
   room.allowedUserIds.clear();
@@ -856,12 +856,51 @@ async function resetManagedRoom(channel) {
   room.claimedAt = null;
   room.panelMessageId = null;
 
-  console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
+  console.log(`[ManagedVoice] 🔄 Rozpoczynam resetowanie kanału #${channel.name}...`);
 
-  // Równoległe wykonanie wszystkich operacji czyszczących (szybkość 50%+ wyższa)
+  // Krok 1: Chwilowe zablokowanie wejścia, zmiana nazwy i statusu na informację o resecie
   await Promise.allSettled([
     channel.edit({ 
-      name: room.defaultName || '🔊 Zamów prywatny kanał 🔏', 
+      name: '🔄 Resetowanie kanału...', 
+      userLimit: 0 
+    }).catch(() => null),
+    setVoiceChannelStatus(channel, '⏳ Trwa resetowanie pokoju...'),
+    channel.permissionOverwrites.set([
+      {
+        id: channel.guild.roles.everyone.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+        deny: [PermissionFlagsBits.Connect] // Zablokowanie dołączania podczas czyszczenia
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak,
+          PermissionFlagsBits.ManageChannels,
+          PermissionFlagsBits.ManageRoles,
+          PermissionFlagsBits.MoveMembers,
+          PermissionFlagsBits.MuteMembers,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.EmbedLinks
+        ],
+        deny: []
+      }
+    ]).catch(() => null),
+    cleanChannelChat(channel)
+  ]);
+
+  // Krótkie opóźnienie (1.2 sekundy), aby czyszczenie przebiegło płynnie
+  await new Promise(resolve => setTimeout(resolve, 1200));
+
+  // Krok 2: Przywrócenie domyślnej nazwy, odblokowanie wejścia dla każdego i wyczyszczenie statusu
+  room.isLocked = false;
+  const defaultName = room.defaultName || '🔊 Zamów prywatny kanał 🔏';
+
+  await Promise.allSettled([
+    channel.edit({ 
+      name: defaultName, 
       userLimit: 0 
     }).catch(() => null),
     setVoiceChannelStatus(channel, ''),
@@ -893,10 +932,12 @@ async function resetManagedRoom(channel) {
         ],
         deny: []
       }
-    ]).catch(() => null),
-    cleanChannelChat(channel)
+    ]).catch(() => null)
   ]);
+
+  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został pomyślnie zresetowany i jest w pełni otwarty dla każdego!`);
 }
+
 
 // Inicjalizacja zarządzanych kanałów przy starcie bota
 async function initManagedVoiceChannels(guild) {
