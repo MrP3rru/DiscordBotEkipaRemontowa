@@ -513,30 +513,68 @@ async function setVoiceChannelStatus(channel, statusText) {
   }
 }
 
-// Budowanie widoku Panelu Kontrolnego na czacie głosowym
-function buildRoomControlPanel(room, ownerMember) {
+// Czyszczenie starych wiadomości bota na czacie kanału głosowego
+async function cleanChannelChat(channel) {
+  try {
+    const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (!messages || messages.size === 0) return;
+    const botMessages = messages.filter(m => m.author.id === client.user.id);
+    if (botMessages.size > 0) {
+      if (typeof channel.bulkDelete === 'function') {
+        await channel.bulkDelete(botMessages, true).catch(() => null);
+      } else {
+        for (const msg of botMessages.values()) {
+          await msg.delete().catch(() => null);
+        }
+      }
+    }
+  } catch (err) {
+    // Cicha obsługa błędów czyszczenia
+  }
+}
+
+// Bezpieczne ustawianie statusu głosowego kanału
+async function setVoiceChannelStatus(channel, statusText) {
+  try {
+    if (typeof channel.setStatus === 'function') {
+      await channel.setStatus(statusText || '');
+    } else if (client.rest) {
+      await client.rest.put(`/channels/${channel.id}/voice-status`, {
+        body: { status: statusText || '' }
+      }).catch(() => null);
+    }
+  } catch (err) {
+    // Ciche ignorowanie, jeśli funkcja nie jest wspierana
+  }
+}
+
+// Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium UI)
+function buildRoomControlPanel(room, ownerMember, channel = null) {
   const ownerMention = ownerMember ? `<@${ownerMember.id}> (${ownerMember.displayName})` : 'Brak';
-  const visibilityText = room.isPrivate ? '🔒 **Ukryty** (Prywatny - tylko zaproszeni)' : '🌐 **Widoczny** (Publiczny dla każdego)';
-  const lockText = room.isLocked ? '⛔ **Zablokowany** (Zakaz wchodzenia)' : '🟢 **Otwarty** (Każdy może wejść)';
-  const limitText = room.userLimit > 0 ? `👥 **${room.userLimit}** osób` : '👥 **Brak limitu** (Nielimitowany)';
-  const speakText = room.isMutedGuests ? '🔇 **Wyciszeni goście** (Tylko gospodarz mówi)' : '🎙️ **Swobodna rozmowa** (Wszyscy mogą mówić)';
+  const membersCount = channel ? channel.members.filter(m => !m.user.bot).size : 1;
+  const limitDisplay = room.userLimit > 0 ? `👥 **${membersCount} / ${room.userLimit}** osób` : `👥 **${membersCount}** (brak limitu)`;
+
+  const visBadge = room.isPrivate ? '🔴 `[ 🔒 UKRYTY - PRYWATNY ]`' : '🟢 `[ 🌐 WIDOCZNY - PUBLICZNY ]`';
+  const lockBadge = room.isLocked ? '🔴 `[ ⛔ ZABLOKOWANY ]`' : '🟢 `[ 🔓 OTWARTY DLA WSZYSTKICH ]`';
+  const micBadge = room.isMutedGuests ? '🔴 `[ 🔇 TYLKO GOSPODARZ MÓWI ]`' : '🟢 `[ 🎙️ SWOBODNA ROZMOWA ]`';
 
   const embed = new EmbedBuilder()
-    .setColor('#5865F2')
-    .setTitle('🎛️ Panel Zarządzania Pokojem Głosowym')
+    .setColor(room.isPrivate ? '#ED4245' : '#5865F2')
+    .setTitle('🎛️ PANEL DOWODZENIA POKOJEM GŁOSOWYM')
     .setDescription(
-      `Witaj na kanale! Jako aktualny **Gospodarz** masz pełną kontrolę nad tym pokojem.\n\n` +
-      `👑 **Gospodarz:** ${ownerMention}\n` +
-      `👁️ **Widoczność:** ${visibilityText}\n` +
-      `🚪 **Dostęp:** ${lockText}\n` +
-      `👥 **Limit miejsc:** ${limitText}\n` +
-      `🎤 **Tryb rozmowy:** ${speakText}\n\n` +
-      `*Użyj poniższych przycisków, aby szybko dostosować ustawienia pokoju:*`
+      `Witaj w centrum zarządzania swoim pokojem głosowym! Jako **Gospodarz** możesz swobodnie nim sterować.\n\n` +
+      `👑 **Gospodarz pokoju:** ${ownerMention}\n` +
+      `👥 **Obecni w pokoju:** ${limitDisplay}\n\n` +
+      `**AKTUALNY STAN POKOJU:**\n` +
+      `> 👁️ **Widoczność:** ${visBadge}\n` +
+      `> 🚪 **Dostęp do pokoju:** ${lockBadge}\n` +
+      `> 🎤 **Mikrofony gości:** ${micBadge}\n\n` +
+      `*Kliknij wybrany przycisk poniżej, aby natychmiast zmienić ustawienie:*`
     )
-    .setFooter({ text: 'Ekipa Remontowa • Panel Pokoju Głosowego' })
+    .setFooter({ text: 'Ekipa Remontowa • Pokój Prywatny • Sterowanie' })
     .setTimestamp();
 
-  // Rząd 1: Ustawienia widoczności, blokady, limitu i nazwy
+  // Rząd 1: Główne przełączniki i modale
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`mv_btn_vis_${room.channelId}`)
@@ -545,7 +583,7 @@ function buildRoomControlPanel(room, ownerMember) {
       .setStyle(room.isPrivate ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_lock_${room.channelId}`)
-      .setLabel(room.isLocked ? 'Odblokuj' : 'Zablokuj')
+      .setLabel(room.isLocked ? 'Odblokuj wejście' : 'Zablokuj wejście')
       .setEmoji(room.isLocked ? '🔓' : '🔒')
       .setStyle(room.isLocked ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
@@ -565,21 +603,21 @@ function buildRoomControlPanel(room, ownerMember) {
       .setStyle(ButtonStyle.Primary)
   );
 
-  // Rząd 2: Zarządzanie ludźmi, wyciszaniem i resetem
+  // Rząd 2: Ludzie, wyciszanie i reset
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`mv_btn_mute_${room.channelId}`)
       .setLabel(room.isMutedGuests ? 'Odcisz gości' : 'Wycisz gości')
       .setEmoji(room.isMutedGuests ? '🔊' : '🔇')
-      .setStyle(room.isMutedGuests ? ButtonStyle.Success : ButtonStyle.Secondary),
+      .setStyle(room.isMutedGuests ? ButtonStyle.Success : ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId(`mv_btn_invite_${room.channelId}`)
-      .setLabel('Zaproś')
+      .setLabel('Zaproś znajomego')
       .setEmoji('➕')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`mv_btn_kick_${room.channelId}`)
-      .setLabel('Wyrzuć')
+      .setLabel('Wyrzuć / Zablokuj')
       .setEmoji('🚫')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
@@ -589,7 +627,7 @@ function buildRoomControlPanel(room, ownerMember) {
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_reset_${room.channelId}`)
-      .setLabel('Reset')
+      .setLabel('Resetuj pokój')
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Secondary)
   );
@@ -603,11 +641,11 @@ async function refreshPanelMessage(channel, room, ownerMember) {
     if (!room.panelMessageId) return;
     const panelMsg = await channel.messages.fetch(room.panelMessageId).catch(() => null);
     if (panelMsg) {
-      const panel = buildRoomControlPanel(room, ownerMember);
+      const panel = buildRoomControlPanel(room, ownerMember, channel);
       await panelMsg.edit(panel).catch(() => null);
     }
   } catch (err) {
-    // Ignoruj błędy pobierania starej wiadomości
+    // Ignoruj błędy
   }
 }
 
@@ -651,6 +689,7 @@ async function syncRoomPermissions(channel, room) {
 
     if (room.isMutedGuests) {
       everyoneDeny.push(PermissionFlagsBits.Speak);
+      everyoneDeny.push(PermissionFlagsBits.UseVAD);
     }
 
     overwrites.push({
@@ -678,13 +717,18 @@ async function syncRoomPermissions(channel, room) {
     // Uprawnienia dla zaproszonych użytkowników (Biała lista)
     for (const userId of room.allowedUserIds) {
       if (userId === room.ownerId) continue;
+      const allowPerms = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect];
+      const denyPerms = [];
+      if (room.isMutedGuests) {
+        denyPerms.push(PermissionFlagsBits.Speak);
+      } else {
+        allowPerms.push(PermissionFlagsBits.Speak);
+      }
+
       overwrites.push({
         id: userId,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect,
-          ...(room.isMutedGuests ? [] : [PermissionFlagsBits.Speak])
-        ]
+        allow: allowPerms,
+        deny: denyPerms
       });
     }
 
@@ -702,7 +746,7 @@ async function syncRoomPermissions(channel, room) {
 
     await channel.permissionOverwrites.set(overwrites);
   } catch (err) {
-    console.error(`[ManagedVoice] ⚠️ Błąd synchronizacji uprawnień na kanale #${channel.name}: ${err.message}. Upewnij się, że rola bota ma włączone 'Zarządzanie kanałami' oraz 'Zarządzanie rolami/uprawnieniami'!`);
+    console.error(`[ManagedVoice] ⚠️ Błąd synchronizacji uprawnień na kanale #${channel.name}: ${err.message}`);
   }
 }
 
@@ -720,21 +764,21 @@ async function claimRoom(channel, member) {
 
   console.log(`[ManagedVoice] Użytkownik ${member.user.tag} został Gospodarzem kanału #${channel.name}.`);
 
-  // Aktualizacja nazwy i statusu
+  // Wyczyść stare wiadomości z czatu kanału przed wysłaniem nowego panelu
+  await cleanChannelChat(channel);
+
   const targetName = `🔒 Kanał: ${member.displayName}`;
-  await channel.edit({ name: targetName }).catch(err => console.warn('[ManagedVoice] Nie udało się zmienić nazwy:', err.message));
-  await setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`);
 
-  // Synchronizacja uprawnień (ukrycie kanału i nadanie praw twórcy)
-  await syncRoomPermissions(channel, room);
+  await Promise.allSettled([
+    channel.edit({ name: targetName }),
+    setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`),
+    syncRoomPermissions(channel, room)
+  ]);
 
-  // Wysłanie panelu na czat głosowy
+  // Wysłanie nowego panelu na czat głosowy
   try {
-    const panelPayload = buildRoomControlPanel(room, member);
-    const msg = await channel.send({
-      content: `👋 Witaj <@${member.id}>! Zostałeś **Gospodarzem** tego pokoju głosowego.`,
-      ...panelPayload
-    });
+    const panelPayload = buildRoomControlPanel(room, member, channel);
+    const msg = await channel.send(panelPayload);
     room.panelMessageId = msg.id;
   } catch (err) {
     console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
@@ -750,14 +794,22 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
   console.log(`[ManagedVoice] Gospodarz kanału #${channel.name} zmieniony na ${newOwnerMember.user.tag}.`);
 
   const targetName = `🔒 Kanał: ${newOwnerMember.displayName}`;
-  await channel.edit({ name: targetName }).catch(() => null);
-  await setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`);
 
-  await syncRoomPermissions(channel, room);
+  // Jeśli nowy gospodarz był wyciszony przez tryb wykładu, odcisz go
+  await newOwnerMember.voice.setMute(false).catch(() => null);
+
+  await Promise.allSettled([
+    channel.edit({ name: targetName }),
+    setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`),
+    syncRoomPermissions(channel, room)
+  ]);
+
+  // Usunięcie starych paneli i wysłanie świeżego
+  await cleanChannelChat(channel);
 
   try {
-    const panelPayload = buildRoomControlPanel(room, newOwnerMember);
-    const reasonText = isAutomatic ? '(poprzedni gospodarz opuścił kanał)' : '(własność została przekazana)';
+    const panelPayload = buildRoomControlPanel(room, newOwnerMember, channel);
+    const reasonText = isAutomatic ? '(poprzedni gospodarz opuścił pokój)' : '(własność została przekazana)';
     const msg = await channel.send({
       content: `👑 **Nowy Gospodarz:** <@${newOwnerMember.id}> przejął zarządzanie tym pokojem ${reasonText}!`,
       ...panelPayload
@@ -768,7 +820,7 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
   }
 }
 
-// Reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
+// Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
   room.ownerId = null;
@@ -781,21 +833,16 @@ async function resetManagedRoom(channel) {
   room.claimedAt = null;
   room.panelMessageId = null;
 
-  console.log(`[ManagedVoice] Resetowanie kanału #${channel.name} do stanu początkowego.`);
+  console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
 
-  // Przywrócenie domyślnej nazwy
-  if (room.defaultName && channel.name !== room.defaultName) {
-    await channel.edit({ name: room.defaultName, userLimit: 0 }).catch(() => null);
-  } else if (channel.userLimit !== 0) {
-    await channel.edit({ userLimit: 0 }).catch(() => null);
-  }
-
-  // Usunięcie statusu głosowego
-  await setVoiceChannelStatus(channel, '');
-
-  // Przywrócenie pełnej widoczności dla @everyone
-  try {
-    await channel.permissionOverwrites.set([
+  // Równoległe wykonanie wszystkich operacji czyszczących (szybkość 50%+ wyższa)
+  await Promise.allSettled([
+    channel.edit({ 
+      name: room.defaultName || '🔊 Pokój Prywatny', 
+      userLimit: 0 
+    }),
+    setVoiceChannelStatus(channel, ''),
+    channel.permissionOverwrites.set([
       {
         id: channel.guild.roles.everyone.id,
         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
@@ -813,10 +860,9 @@ async function resetManagedRoom(channel) {
           PermissionFlagsBits.SendMessages
         ]
       }
-    ]);
-  } catch (err) {
-    console.warn('[ManagedVoice] Błąd resetowania uprawnień:', err.message);
-  }
+    ]),
+    cleanChannelChat(channel)
+  ]);
 }
 
 // Inicjalizacja zarządzanych kanałów przy starcie bota
@@ -831,17 +877,6 @@ async function initManagedVoiceChannels(guild) {
       if (channel && channel.isVoiceBased()) {
         const room = getOrCreateRoom(channel);
         room.defaultName = channel.name;
-
-        // Diagnostyka uprawnień bota na tym konkretnym kanale
-        const me = guild.members.me;
-        if (me) {
-          const perms = channel.permissionsFor(me);
-          const hasManageChannels = perms.has(PermissionFlagsBits.ManageChannels);
-          const hasManageRoles = perms.has(PermissionFlagsBits.ManageRoles);
-          if (!hasManageChannels || !hasManageRoles) {
-            console.warn(`[ManagedVoice] ⚠️ UWAGA: Bot nie ma pełnych uprawnień na kanale #${channel.name}! Włącz dla bota uprawnienia: 'Zarządzanie kanałami' (ManageChannels: ${hasManageChannels}) oraz 'Zarządzanie uprawnieniami/rolami' (ManageRoles: ${hasManageRoles})!`);
-          }
-        }
 
         const nonBots = channel.members.filter(m => !m.user.bot);
         if (nonBots.size === 0) {
@@ -890,8 +925,13 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
         if (!room.ownerId || nonBotMembers.size === 1) {
           await claimRoom(channel, member);
-        } else if (room.isMutedGuests && member.id !== room.ownerId) {
-          await syncRoomPermissions(channel, room);
+        } else {
+          // Jeśli ktoś dołączył do aktywnego pokoju i włączone jest wyciszenie gości -> wycisz go na serwerze!
+          if (room.isMutedGuests && member.id !== room.ownerId) {
+            await member.voice.setMute(true).catch(() => null);
+          }
+          const ownerMember = room.ownerId ? channel.members.get(room.ownerId) : null;
+          await refreshPanelMessage(channel, room, ownerMember);
         }
       }
     }
@@ -910,6 +950,9 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
           const candidates = Array.from(remainingNonBots.values());
           const randomNewOwner = candidates[Math.floor(Math.random() * candidates.length)];
           await transferRoomOwnership(channel, randomNewOwner, true);
+        } else {
+          const ownerMember = room.ownerId ? channel.members.get(room.ownerId) : null;
+          await refreshPanelMessage(channel, room, ownerMember);
         }
       }
     }
@@ -925,7 +968,7 @@ async function handleManagedVoiceInteraction(interaction) {
 
   try {
     const parts = customId.split('_'); // np. ['mv', 'btn', 'vis', channelId] lub ['mv', 'modal', 'rename', channelId]
-    const actionType = parts[1]; // 'btn', 'modal', 'select'
+    const actionType = parts[1]; // 'btn', 'modal', 'select', 'userselect'
     const actionName = parts[2]; // 'vis', 'lock', 'limit', 'rename', 'status', 'mute', 'invite', 'kick', 'transfer', 'reset'
     const channelId = parts.slice(3).join('_');
 
@@ -956,7 +999,7 @@ async function handleManagedVoiceInteraction(interaction) {
       if (actionName === 'vis') {
         room.isPrivate = !room.isPrivate;
         await syncRoomPermissions(channel, room);
-        const panel = buildRoomControlPanel(room, ownerMember);
+        const panel = buildRoomControlPanel(room, ownerMember, channel);
         await interaction.update(panel);
         return true;
       }
@@ -964,15 +1007,22 @@ async function handleManagedVoiceInteraction(interaction) {
       if (actionName === 'lock') {
         room.isLocked = !room.isLocked;
         await syncRoomPermissions(channel, room);
-        const panel = buildRoomControlPanel(room, ownerMember);
+        const panel = buildRoomControlPanel(room, ownerMember, channel);
         await interaction.update(panel);
         return true;
       }
 
       if (actionName === 'mute') {
         room.isMutedGuests = !room.isMutedGuests;
+        
+        // Aktywny serwerowy mute / unmute wszystkich obecnych gości
+        const guests = channel.members.filter(m => !m.user.bot && m.id !== room.ownerId);
+        for (const guest of guests.values()) {
+          await guest.voice.setMute(room.isMutedGuests).catch(() => null);
+        }
+
         await syncRoomPermissions(channel, room);
-        const panel = buildRoomControlPanel(room, ownerMember);
+        const panel = buildRoomControlPanel(room, ownerMember, channel);
         await interaction.update(panel);
         return true;
       }
@@ -984,9 +1034,16 @@ async function handleManagedVoiceInteraction(interaction) {
         room.isMutedGuests = false;
         room.allowedUserIds.clear();
         room.blockedUserIds.clear();
+
+        // Odcisz wszystkich gości
+        const guests = channel.members.filter(m => !m.user.bot);
+        for (const guest of guests.values()) {
+          await guest.voice.setMute(false).catch(() => null);
+        }
+
         await channel.edit({ userLimit: 0 }).catch(() => null);
         await syncRoomPermissions(channel, room);
-        const panel = buildRoomControlPanel(room, ownerMember);
+        const panel = buildRoomControlPanel(room, ownerMember, channel);
         await interaction.update(panel);
         return true;
       }
@@ -1050,13 +1107,13 @@ async function handleManagedVoiceInteraction(interaction) {
       if (actionName === 'invite') {
         const selectMenu = new UserSelectMenuBuilder()
           .setCustomId(`mv_select_invite_${channelId}`)
-          .setPlaceholder('🔍 Wybierz użytkownika, którego chcesz zaprosić...')
+          .setPlaceholder('🔍 Wybierz gracza z serwera do zaproszenia...')
           .setMinValues(1)
           .setMaxValues(1);
 
         const row = new ActionRowBuilder().addComponents(selectMenu);
         await interaction.reply({
-          content: '➕ **Zaproś znajomego:** Wybierz osobę, która ma otrzymać dostęp do Twojego prywatnego pokoju:',
+          content: '➕ **Zaproś znajomego:** Wybierz osobę z serwera, która ma otrzymać pełny wstęp i widoczność pokoju:',
           components: [row],
           flags: [MessageFlags.Ephemeral]
         });
@@ -1064,31 +1121,71 @@ async function handleManagedVoiceInteraction(interaction) {
       }
 
       if (actionName === 'kick') {
-        const selectMenu = new UserSelectMenuBuilder()
-          .setCustomId(`mv_select_kick_${channelId}`)
-          .setPlaceholder('🚫 Wybierz użytkownika do wyrzucenia/zablokowania...')
-          .setMinValues(1)
-          .setMaxValues(1);
+        const otherMembers = Array.from(channel.members.filter(m => !m.user.bot && m.id !== room.ownerId).values());
+        
+        if (otherMembers.length > 0) {
+          const selectMenu = new StringSelectMenuBuilder()
+            .setCustomId(`mv_select_kick_${channelId}`)
+            .setPlaceholder('🚫 Wybierz osobę obecną w pokoju do wyrzucenia...')
+            .addOptions(
+              otherMembers.map(m => ({
+                label: m.displayName.substring(0, 25),
+                description: `@${m.user.username}`.substring(0, 50),
+                value: m.id,
+                emoji: '👢'
+              }))
+            );
 
-        const row = new ActionRowBuilder().addComponents(selectMenu);
-        await interaction.reply({
-          content: '🚫 **Wyrzuć i Zablokuj:** Wybierz osobę, którą chcesz odłączyć od kanału i zablokować przed wstępem:',
-          components: [row],
-          flags: [MessageFlags.Ephemeral]
-        });
+          const row = new ActionRowBuilder().addComponents(selectMenu);
+          await interaction.reply({
+            content: '🚫 **Wyrzucenie z pokoju:** Wybierz osobę obecną w pokoju, którą chcesz natychmiast odłączyć i zablokować:',
+            components: [row],
+            flags: [MessageFlags.Ephemeral]
+          });
+        } else {
+          // Jeśli nikt inny nie siedzi w pokoju, pozwól zablokować dowolnego użytkownika z serwera
+          const selectMenu = new UserSelectMenuBuilder()
+            .setCustomId(`mv_userselect_kick_${channelId}`)
+            .setPlaceholder('🔍 Wybierz użytkownika z serwera do zablokowania...')
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const row = new ActionRowBuilder().addComponents(selectMenu);
+          await interaction.reply({
+            content: '🚫 **Zablokuj użytkownika:** W pokoju nikogo innego nie ma. Wybierz osobę z serwera, aby zablokować jej wstęp:',
+            components: [row],
+            flags: [MessageFlags.Ephemeral]
+          });
+        }
         return true;
       }
 
       if (actionName === 'transfer') {
-        const selectMenu = new UserSelectMenuBuilder()
+        const otherMembers = Array.from(channel.members.filter(m => !m.user.bot && m.id !== room.ownerId).values());
+        
+        if (otherMembers.length === 0) {
+          await interaction.reply({
+            content: 'ℹ️ **Jesteś jedyną osobą w tym pokoju!**\nAby przekazać komuś koronę, najpierw zaproś lub poczekaj, aż ktoś wejdzie do Twojego pokoju.',
+            flags: [MessageFlags.Ephemeral]
+          });
+          return true;
+        }
+
+        const selectMenu = new StringSelectMenuBuilder()
           .setCustomId(`mv_select_transfer_${channelId}`)
-          .setPlaceholder('👑 Wybierz nowego gospodarza kanału...')
-          .setMinValues(1)
-          .setMaxValues(1);
+          .setPlaceholder('👑 Wybierz osobę z pokoju, która ma zostać nowym Gospodarzem...')
+          .addOptions(
+            otherMembers.map(m => ({
+              label: m.displayName.substring(0, 25),
+              description: `@${m.user.username}`.substring(0, 50),
+              value: m.id,
+              emoji: '👤'
+            }))
+          );
 
         const row = new ActionRowBuilder().addComponents(selectMenu);
         await interaction.reply({
-          content: '👑 **Przekaż Koronę:** Wybierz osobę, która ma zostać nowym Gospodarzem tego pokoju:',
+          content: '👑 **Przekaż Koronę:** Wybierz osobę obecną w Twoim pokoju głosowym:',
           components: [row],
           flags: [MessageFlags.Ephemeral]
         });
@@ -1111,7 +1208,7 @@ async function handleManagedVoiceInteraction(interaction) {
           await interaction.reply({ content: `✅ Nazwa kanału została zmieniona na: **${newName}**`, flags: [MessageFlags.Ephemeral] });
         } catch (err) {
           await interaction.reply({
-            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Discord ogranicza częstą zmianę nazwy kanału (maks. 2 razy na 10 minut). Upewnij się też, że bot ma uprawnienie 'Zarządzanie kanałami'.`,
+            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Discord ogranicza zbyt częstą zmianę nazwy kanału (maks. 2 razy na 10 minut).`,
             flags: [MessageFlags.Ephemeral]
           });
         }
@@ -1137,7 +1234,7 @@ async function handleManagedVoiceInteraction(interaction) {
         await refreshPanelMessage(channel, room, ownerMember);
 
         await interaction.reply({
-          content: `✅ Limit osób na kanale został zmieniony na: **${limitNum === 0 ? 'Brak limitu' : `${limitNum} osób`}**`,
+          content: `✅ Limit osób na kanale został ustawiony na: **${limitNum === 0 ? 'Brak limitu' : `${limitNum} osób`}**`,
           flags: [MessageFlags.Ephemeral]
         });
         return true;
@@ -1155,8 +1252,8 @@ async function handleManagedVoiceInteraction(interaction) {
       }
     }
 
-    // --- OBSŁUGA MENU WYBORU (USER SELECT) ---
-    if (actionType === 'select') {
+    // --- OBSŁUGA MENU WYBORU (SELECT / USERSELECT) ---
+    if (actionType === 'select' || actionType === 'userselect') {
       const targetUserId = interaction.values[0];
 
       if (actionName === 'invite') {
@@ -1166,7 +1263,7 @@ async function handleManagedVoiceInteraction(interaction) {
         await refreshPanelMessage(channel, room, ownerMember);
 
         await interaction.update({
-          content: `✅ Pomyślnie nadano dostęp i widoczność dla użytkownika <@${targetUserId}>!`,
+          content: `✅ Pomyślnie nadano dostęp i widoczność dla użytkownika <@${targetUserId}>! Może teraz bez przeszkód dołączyć do Twojego pokoju.`,
           components: []
         });
         return true;
@@ -1193,7 +1290,7 @@ async function handleManagedVoiceInteraction(interaction) {
         }
 
         await interaction.update({
-          content: `🚫 Użytkownik <@${targetUserId}> został wyrzucony i zablokowany przed wejściem na ten kanał.`,
+          content: `🚫 Użytkownik <@${targetUserId}> został natychmiast wyrzucony i zablokowany przed wejściem na ten kanał.`,
           components: []
         });
         return true;
@@ -1230,7 +1327,7 @@ async function handleManagedVoiceInteraction(interaction) {
   } catch (err) {
     console.error('[ManagedVoice] Błąd podczas obsługi interakcji:', err);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'Wystąpił błąd podczas wykonywania tej akcji.', flags: [MessageFlags.Ephemeral] }).catch(() => null);
+      await interaction.reply({ content: '⏳ Trwa przetwarzanie... Spróbuj ponownie za moment.', flags: [MessageFlags.Ephemeral] }).catch(() => null);
     }
     return true;
   }
