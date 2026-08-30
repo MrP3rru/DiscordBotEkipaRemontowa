@@ -775,26 +775,8 @@ async function syncRoomPermissions(channel, room) {
   }
 }
 
-// Bezpieczna zmiana nazwy kanału bez blokowania pętli zdarzeń przy rate-limicie Discorda
-function safeRenameChannel(channel, targetName) {
-  if (!channel || channel.name === targetName) return;
-  channel.edit({ name: targetName }).catch(err => {
-    console.warn(`[ManagedVoice] Discord rate limit dla nazwy kanału #${channel.name}: ${err.message}`);
-  });
-}
-
 // Przejęcie kanału przez pierwszego użytkownika
 async function claimRoom(channel, member) {
-  // Weryfikacja: upewnij się, że użytkownik jest fizycznie połączony z tym kanałem
-  if (!member.voice || member.voice.channelId !== channel.id) {
-    console.log(`[ManagedVoice] Anulowano claimRoom dla ${member.user.tag} - użytkownik nie jest połączony z kanałem #${channel.name}.`);
-    const remaining = channel.members.filter(m => !m.user.bot && m.voice && m.voice.channelId === channel.id);
-    if (remaining.size === 0) {
-      await resetManagedRoom(channel);
-    }
-    return;
-  }
-
   const room = getOrCreateRoom(channel);
   room.ownerId = member.id;
   room.isPrivate = true; // domyślnie ukryty dla reszty serwera
@@ -807,18 +789,13 @@ async function claimRoom(channel, member) {
 
   console.log(`[ManagedVoice] Użytkownik ${member.user.tag} został Gospodarzem kanału #${channel.name}.`);
 
-  const targetName = `🔒 Kanał: ${member.displayName}`;
-
-  // 1. Zsynchronizuj uprawnienia i status (natychmiast)
+  // 1. Zsynchronizuj uprawnienia i ustaw status gospodarza w kanale
   await Promise.allSettled([
     setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
 
-  // 2. Bezpieczna zmiana nazwy w tle
-  safeRenameChannel(channel, targetName);
-
-  // 3. Wysłanie nowego panelu na czat głosowy
+  // 2. Wysłanie nowego panelu na czat głosowy
   try {
     const panelPayload = buildRoomControlPanel(room, member, channel);
     const msg = await channel.send({
@@ -826,6 +803,7 @@ async function claimRoom(channel, member) {
       ...panelPayload
     });
     room.panelMessageId = msg.id;
+    console.log(`[ManagedVoice] ✅ Panel wysłany dla ${member.user.tag}, ID: ${msg.id}`);
   } catch (err) {
     console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
   }
@@ -839,8 +817,6 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
 
   console.log(`[ManagedVoice] Gospodarz kanału #${channel.name} zmieniony na ${newOwnerMember.user.tag}.`);
 
-  const targetName = `🔒 Kanał: ${newOwnerMember.displayName}`;
-
   // Jeśli nowy gospodarz był wyciszony przez tryb wykładu, odcisz go
   await newOwnerMember.voice.setMute(false).catch(() => null);
 
@@ -848,8 +824,6 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
     setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
-
-  safeRenameChannel(channel, targetName);
 
   // Odświeżenie istniejącego panelu lub wysłanie nowego
   try {
@@ -882,7 +856,6 @@ async function resetManagedRoom(channel) {
   room.claimedAt = null;
   room.panelMessageId = null;
 
-  const defaultName = '🔊 Zamów prywatny kanał 🔏';
   console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
 
   // 1. Zawsze natychmiast odblokuj i zresetuj uprawnienia dla @everyone i bota
@@ -922,12 +895,8 @@ async function resetManagedRoom(channel) {
     cleanChannelChat(channel)
   ]);
 
-  // 3. Bezpieczna zmiana nazwy w tle (bez blokowania wątku)
-  safeRenameChannel(channel, defaultName);
-
-  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został pomyślnie zresetowany i jest w 100% gotowy do użycia.`);
+  console.log(`[ManagedVoice] ✅ Kanał #${channel.name} został pomyślnie zresetowany i jest w 100% gotowy do użycia.`);
 }
-
 
 // Inicjalizacja zarządzanych kanałów przy starcie bota
 async function initManagedVoiceChannels(guild) {
@@ -940,17 +909,12 @@ async function initManagedVoiceChannels(guild) {
       const channel = await guild.channels.fetch(chanId).catch(() => null);
       if (channel && channel.isVoiceBased()) {
         const room = getOrCreateRoom(channel);
-        if (!room.defaultName || room.defaultName.startsWith('🔒')) {
-          room.defaultName = '🔊 Zamów prywatny kanał 🔏';
-        }
-
-        // Weryfikacja osób FAKTYCZNIE połączonych z kanałem głosowym
-        const actualConnected = channel.members.filter(m => !m.user.bot && m.voice && m.voice.channelId === channel.id);
-        if (actualConnected.size === 0) {
+        const nonBots = channel.members.filter(m => !m.user.bot);
+        if (nonBots.size === 0) {
           console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) jest pusty. Ustawiam stan domyślny.`);
           await resetManagedRoom(channel);
         } else {
-          const firstMember = actualConnected.first();
+          const firstMember = nonBots.first();
           console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) ma obecnych użytkowników. Przypisuję gospodarza: ${firstMember.user.tag}.`);
           await claimRoom(channel, firstMember);
         }
@@ -988,11 +952,11 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
       const channel = newState.channel || await client.channels.fetch(newChannelId).catch(() => null);
       if (channel) {
         const room = getOrCreateRoom(channel);
-        const connectedMembers = channel.members.filter(m => !m.user.bot && m.voice && m.voice.channelId === channel.id);
+        const nonBotMembers = channel.members.filter(m => !m.user.bot);
 
-        console.log(`[ManagedVoice] ${member.user.tag} wszedł na kanał #${channel.name}. Liczba osób: ${connectedMembers.size}, Aktualny gospodarz: ${room.ownerId}`);
+        console.log(`[ManagedVoice] ${member.user.tag} wszedł na kanał #${channel.name}. Liczba osób: ${nonBotMembers.size}, Aktualny gospodarz: ${room.ownerId}`);
 
-        if (!room.ownerId || connectedMembers.size <= 1) {
+        if (!room.ownerId || nonBotMembers.size <= 1) {
           await claimRoom(channel, member);
         } else {
           if (room.isMutedGuests && member.id !== room.ownerId) {
@@ -1009,8 +973,7 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
       const channel = oldState.channel || await client.channels.fetch(oldChannelId).catch(() => null);
       if (channel) {
         const room = getOrCreateRoom(channel);
-        // Kluczowe: sprawdzamy osoby FAKTYCZNIE połączone z kanałem, wykluczając wychodzącego
-        const remainingMembers = channel.members.filter(m => !m.user.bot && m.id !== member.id && m.voice && m.voice.channelId === channel.id);
+        const remainingMembers = channel.members.filter(m => !m.user.bot && m.id !== member.id);
 
         console.log(`[ManagedVoice] ${member.user.tag} opuścił kanał #${channel.name}. Pozostało osób: ${remainingMembers.size}`);
 
@@ -1030,6 +993,7 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
     console.error('[ManagedVoice] Błąd w handleManagedVoiceStateUpdate:', err.message);
   }
 }
+
 
 // Obsługa interakcji z panelem prywatnego pokoju (Przyciski, Modale, Menu wyboru)
 
