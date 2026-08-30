@@ -655,7 +655,7 @@ async function syncRoomPermissions(channel, room) {
   try {
     const overwrites = [];
 
-    // Uprawnienia Bota (zawsze pełna kontrola)
+    // Uprawnienia Bota (zawsze pełna kontrola i prawo do pisania)
     overwrites.push({
       id: client.user.id,
       allow: [
@@ -673,15 +673,21 @@ async function syncRoomPermissions(channel, room) {
       ]
     });
 
-    // Uprawnienia dla @everyone
+    // Uprawnienia dla @everyone (brak prawa do pisania wiadomości tekstowych)
     const everyoneAllow = [];
-    const everyoneDeny = [];
+    const everyoneDeny = [
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.SendMessagesInThreads,
+      PermissionFlagsBits.CreatePublicThreads,
+      PermissionFlagsBits.CreatePrivateThreads
+    ];
 
     if (room.isPrivate) {
       everyoneDeny.push(PermissionFlagsBits.ViewChannel);
       everyoneDeny.push(PermissionFlagsBits.Connect);
     } else {
       everyoneAllow.push(PermissionFlagsBits.ViewChannel);
+      everyoneAllow.push(PermissionFlagsBits.ReadMessageHistory);
       if (room.isLocked) {
         everyoneDeny.push(PermissionFlagsBits.Connect);
       } else {
@@ -700,7 +706,7 @@ async function syncRoomPermissions(channel, room) {
       deny: everyoneDeny
     });
 
-    // Uprawnienia Gospodarza (Właściciela)
+    // Uprawnienia Gospodarza (Właściciela) - tylko sterowanie panelem, bez pisania
     if (room.ownerId) {
       overwrites.push({
         id: room.ownerId,
@@ -711,10 +717,12 @@ async function syncRoomPermissions(channel, room) {
           PermissionFlagsBits.MoveMembers,
           PermissionFlagsBits.MuteMembers,
           PermissionFlagsBits.DeafenMembers,
-          PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.EmbedLinks,
-          PermissionFlagsBits.AttachFiles
+          PermissionFlagsBits.EmbedLinks
+        ],
+        deny: [
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.SendMessagesInThreads
         ]
       });
     }
@@ -725,10 +733,13 @@ async function syncRoomPermissions(channel, room) {
       const allowPerms = [
         PermissionFlagsBits.ViewChannel, 
         PermissionFlagsBits.Connect,
-        PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory
       ];
-      const denyPerms = [];
+      const denyPerms = [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.SendMessagesInThreads
+      ];
+
       if (room.isMutedGuests) {
         denyPerms.push(PermissionFlagsBits.Speak);
       } else {
@@ -749,7 +760,8 @@ async function syncRoomPermissions(channel, room) {
         id: userId,
         deny: [
           PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.SendMessages
         ]
       });
     }
@@ -759,6 +771,7 @@ async function syncRoomPermissions(channel, room) {
     console.error(`[ManagedVoice] ⚠️ Błąd synchronizacji uprawnień na kanale #${channel.name}: ${err.message}`);
   }
 }
+
 
 // Przejęcie kanału przez pierwszego użytkownika
 async function claimRoom(channel, member) {
@@ -859,7 +872,18 @@ async function resetManagedRoom(channel) {
     channel.permissionOverwrites.set([
       {
         id: channel.guild.roles.everyone.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak]
+        allow: [
+          PermissionFlagsBits.ViewChannel, 
+          PermissionFlagsBits.Connect, 
+          PermissionFlagsBits.Speak,
+          PermissionFlagsBits.ReadMessageHistory
+        ],
+        deny: [
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.SendMessagesInThreads,
+          PermissionFlagsBits.CreatePublicThreads,
+          PermissionFlagsBits.CreatePrivateThreads
+        ]
       },
       {
         id: client.user.id,
@@ -871,7 +895,9 @@ async function resetManagedRoom(channel) {
           PermissionFlagsBits.ManageRoles,
           PermissionFlagsBits.MoveMembers,
           PermissionFlagsBits.MuteMembers,
-          PermissionFlagsBits.SendMessages
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.EmbedLinks
         ]
       }
     ]).catch(() => null),
