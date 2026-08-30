@@ -840,12 +840,12 @@ async function resetManagedRoom(channel) {
     channel.edit({ 
       name: room.defaultName || '🔊 Pokój Prywatny', 
       userLimit: 0 
-    }),
+    }).catch(() => null),
     setVoiceChannelStatus(channel, ''),
     channel.permissionOverwrites.set([
       {
         id: channel.guild.roles.everyone.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak]
       },
       {
         id: client.user.id,
@@ -860,7 +860,7 @@ async function resetManagedRoom(channel) {
           PermissionFlagsBits.SendMessages
         ]
       }
-    ]),
+    ]).catch(() => null),
     cleanChannelChat(channel)
   ]);
 }
@@ -923,7 +923,7 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
         const room = getOrCreateRoom(channel);
         const nonBotMembers = channel.members.filter(m => !m.user.bot);
 
-        if (!room.ownerId || nonBotMembers.size === 1) {
+        if (!room.ownerId || nonBotMembers.size <= 1) {
           await claimRoom(channel, member);
         } else {
           // Jeśli ktoś dołączył do aktywnego pokoju i włączone jest wyciszenie gości -> wycisz go na serwerze!
@@ -938,10 +938,11 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
     // 2. Użytkownik opuścił zarządzany kanał
     if (isOldManaged && oldChannelId !== newChannelId) {
-      const channel = oldState.channel;
+      const channel = oldState.channel || await client.channels.fetch(oldChannelId).catch(() => null);
       if (channel) {
         const room = getOrCreateRoom(channel);
-        const remainingNonBots = channel.members.filter(m => !m.user.bot);
+        // Kluczowe: wykluczamy użytkownika, który WŁAŚNIE OPUŚCIŁ kanał (discord.js cache może go jeszcze trzymać)
+        const remainingNonBots = channel.members.filter(m => !m.user.bot && m.id !== member.id);
 
         if (remainingNonBots.size === 0) {
           await resetManagedRoom(channel);
@@ -960,6 +961,7 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
     console.error('[ManagedVoice] Błąd w handleManagedVoiceStateUpdate:', err.message);
   }
 }
+
 
 // Obsługa interakcji z panelem prywatnego pokoju (Przyciski, Modale, Menu wyboru)
 async function handleManagedVoiceInteraction(interaction) {
