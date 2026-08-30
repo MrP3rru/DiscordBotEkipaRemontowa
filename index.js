@@ -499,35 +499,23 @@ function getOrCreateRoom(channel) {
   return managedRooms.get(channel.id);
 }
 
-// Bezpieczne ustawianie statusu głosowego kanału
-async function setVoiceChannelStatus(channel, statusText) {
+// Czyszczenie starych wiadomości na czacie kanału głosowego (z opcją zachowania aktywnego panelu)
+async function cleanChannelChat(channel, preserveMessageId = null) {
   try {
-    if (typeof channel.setStatus === 'function') {
-      await channel.setStatus(statusText || '');
-    } else if (client.rest) {
-      await client.rest.put(`/channels/${channel.id}/voice-status`, {
-        body: { status: statusText || '' }
-      }).catch(() => null);
-    }
-  } catch (err) {
-    // Ciche ignorowanie, jeśli funkcja nie jest wspierana na danym poziomie serwera
-  }
-}
-
-// Czyszczenie wszystkich wiadomości na czacie kanału głosowego
-async function cleanChannelChat(channel) {
-  try {
-    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
     if (!messages || messages.size === 0) return;
 
+    const toDelete = messages.filter(m => !preserveMessageId || m.id !== preserveMessageId);
+    if (toDelete.size === 0) return;
+
     if (typeof channel.bulkDelete === 'function') {
-      await channel.bulkDelete(messages, true).catch(() => null);
-    }
-    
-    // Usunięcie ewentualnych pozostałych wiadomości
-    const remaining = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-    if (remaining && remaining.size > 0) {
-      for (const msg of remaining.values()) {
+      await channel.bulkDelete(toDelete, true).catch(async () => {
+        for (const msg of toDelete.values()) {
+          await msg.delete().catch(() => null);
+        }
+      });
+    } else {
+      for (const msg of toDelete.values()) {
         await msg.delete().catch(() => null);
       }
     }
@@ -550,6 +538,7 @@ async function setVoiceChannelStatus(channel, statusText) {
     // Ciche ignorowanie, jeśli funkcja nie jest wspierana
   }
 }
+
 
 // Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium, Ultra-Czytelny UI z polami)
 function buildRoomControlPanel(room, ownerMember, channel = null) {
@@ -650,7 +639,6 @@ function buildRoomControlPanel(room, ownerMember, channel = null) {
   return { embeds: [embed], components: [row1, row2] };
 }
 
-
 // Odświeżenie wiadomości panelu na czacie kanału
 async function refreshPanelMessage(channel, room, ownerMember) {
   try {
@@ -658,7 +646,10 @@ async function refreshPanelMessage(channel, room, ownerMember) {
     const panelMsg = await channel.messages.fetch(room.panelMessageId).catch(() => null);
     if (panelMsg) {
       const panel = buildRoomControlPanel(room, ownerMember, channel);
-      await panelMsg.edit(panel).catch(() => null);
+      await panelMsg.edit({
+        content: room.ownerId ? `👋 Witaj <@${room.ownerId}>! Oto Twój prywatny panel kontrolny pokoju:` : undefined,
+        ...panel
+      }).catch(() => null);
     }
   } catch (err) {
     // Ignoruj błędy
@@ -688,14 +679,9 @@ async function syncRoomPermissions(channel, room) {
       ]
     });
 
-    // Uprawnienia dla @everyone (brak prawa do pisania wiadomości tekstowych)
+    // Uprawnienia dla @everyone
     const everyoneAllow = [];
-    const everyoneDeny = [
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.SendMessagesInThreads,
-      PermissionFlagsBits.CreatePublicThreads,
-      PermissionFlagsBits.CreatePrivateThreads
-    ];
+    const everyoneDeny = [];
 
     if (room.isPrivate) {
       everyoneDeny.push(PermissionFlagsBits.ViewChannel);
@@ -783,7 +769,6 @@ async function syncRoomPermissions(channel, room) {
   }
 }
 
-
 // Przejęcie kanału przez pierwszego użytkownika
 async function claimRoom(channel, member) {
   const room = getOrCreateRoom(channel);
@@ -798,9 +783,6 @@ async function claimRoom(channel, member) {
 
   console.log(`[ManagedVoice] Użytkownik ${member.user.tag} został Gospodarzem kanału #${channel.name}.`);
 
-  // Wyczyść stare wiadomości z czatu kanału przed wysłaniem nowego panelu
-  await cleanChannelChat(channel);
-
   const targetName = `🔒 Kanał: ${member.displayName}`;
 
   await Promise.allSettled([
@@ -808,6 +790,9 @@ async function claimRoom(channel, member) {
     setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
+
+  // Usunięcie starych wiadomości z czatu przed wysłaniem nowego panelu
+  await cleanChannelChat(channel);
 
   // Wysłanie nowego panelu na czat głosowy
   try {
@@ -821,6 +806,7 @@ async function claimRoom(channel, member) {
     console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
   }
 }
+
 
 
 // Przekazanie własności innemu użytkownikowi (automatyczne lub ręczne)
