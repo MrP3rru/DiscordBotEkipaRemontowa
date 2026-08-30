@@ -494,11 +494,13 @@ function getOrCreateRoom(channel) {
       allowedUserIds: new Set(),
       blockedUserIds: new Set(),
       panelMessageId: null,
-      claimedAt: null
+      claimedAt: null,
+      idleStatusTimer: null
     });
   }
   return managedRooms.get(channel.id);
 }
+
 
 // Czyszczenie starych wiadomości na czacie kanału głosowego (z opcją zachowania aktywnego panelu)
 async function cleanChannelChat(channel, preserveMessageId = null) {
@@ -780,9 +782,13 @@ async function syncRoomPermissions(channel, room) {
 }
 
 // Przejęcie kanału przez pierwszego użytkownika
-
 async function claimRoom(channel, member) {
   const room = getOrCreateRoom(channel);
+  if (room.idleStatusTimer) {
+    clearTimeout(room.idleStatusTimer);
+    room.idleStatusTimer = null;
+  }
+
   room.ownerId = member.id;
   room.isPrivate = true; // domyślnie ukryty dla reszty serwera
   room.isLocked = false;
@@ -796,7 +802,7 @@ async function claimRoom(channel, member) {
 
   // 1. Zsynchronizuj uprawnienia i ustaw status gospodarza w kanale
   await Promise.allSettled([
-    setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`),
+    setVoiceChannelStatus(channel, `👑 Gospodarz: ${member.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
 
@@ -817,6 +823,11 @@ async function claimRoom(channel, member) {
 // Przekazanie własności innemu użytkownikowi (automatyczne lub ręczne)
 async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true) {
   const room = getOrCreateRoom(channel);
+  if (room.idleStatusTimer) {
+    clearTimeout(room.idleStatusTimer);
+    room.idleStatusTimer = null;
+  }
+
   room.ownerId = newOwnerMember.id;
   room.allowedUserIds.delete(newOwnerMember.id);
 
@@ -826,7 +837,7 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
   await newOwnerMember.voice.setMute(false).catch(() => null);
 
   await Promise.allSettled([
-    setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`),
+    setVoiceChannelStatus(channel, `👑 Gospodarz: ${newOwnerMember.displayName}`),
     syncRoomPermissions(channel, room)
   ]);
 
@@ -851,6 +862,11 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
 // Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
+  if (room.idleStatusTimer) {
+    clearTimeout(room.idleStatusTimer);
+    room.idleStatusTimer = null;
+  }
+
   room.ownerId = null;
   room.isPrivate = false;
   room.isLocked = false;
@@ -900,6 +916,20 @@ async function resetManagedRoom(channel) {
     cleanChannelChat(channel)
   ]);
 
+  // 3. Po 30 sekundach braku aktywności ustaw estetyczny status "🟢 Wolny pokój" (tylko jeden raz)
+  room.idleStatusTimer = setTimeout(async () => {
+    try {
+      const currentRoom = getOrCreateRoom(channel);
+      const activeMembers = channel.members.filter(m => !m.user.bot);
+      if (!currentRoom.ownerId && activeMembers.size === 0) {
+        await setVoiceChannelStatus(channel, '🟢 Kanał wolny • Wejdź, aby przejąć! 🔏');
+        console.log(`[ManagedVoice] Ustawiono status bezczynności dla kanału #${channel.name}.`);
+      }
+    } catch (err) {
+      // Ciche ignorowanie
+    }
+  }, 30000);
+
   console.log(`[ManagedVoice] ✅ Kanał #${channel.name} został pomyślnie zresetowany i jest w 100% gotowy do użycia.`);
 }
 
@@ -918,6 +948,7 @@ async function initManagedVoiceChannels(guild) {
         if (nonBots.size === 0) {
           console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) jest pusty. Ustawiam stan domyślny.`);
           await resetManagedRoom(channel);
+          await setVoiceChannelStatus(channel, '🟢 Kanał wolny • Wejdź, aby przejąć! 🔏');
         } else {
           const firstMember = nonBots.first();
           console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) ma obecnych użytkowników. Przypisuję gospodarza: ${firstMember.user.tag}.`);
@@ -931,6 +962,7 @@ async function initManagedVoiceChannels(guild) {
     }
   }
 }
+
 
 // Obsługa zdarzeń głosowych dla kanałów zarządzanych (Strict Isolation)
 async function handleManagedVoiceStateUpdate(oldState, newState) {
