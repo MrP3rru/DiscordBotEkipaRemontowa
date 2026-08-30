@@ -12,13 +12,30 @@ Bot Discord dedykowany dla serwera **Ekipa Remontowa**, służący do monitorowa
    - `/monthly [uzytkownik]` – czas spędzony w bieżącym miesiącu oraz pozycja w rankingu miesięcznym.
    - `/time [uzytkownik] [okres]` – szybkie sprawdzenie czasu dla wybranego okresu lub łącznie.
    - `/leaderboard [okres] [strona]` – interaktywny ranking TOP użytkowników z podziałem na strony (przyciski `◀ Poprzednia` / `Następna ▶`) oraz filtrowaniem okresów (`łącznie`, `dzisiaj`, `tydzień`, `miesiąc`).
-3. **Automatyczne Czyszczenie Kanału**: Co określony czas usuwa wiadomości starsze niż zadany limit na wskazanym kanale.
-4. **Komendy Moderacyjne**:
+3. **Prywatne Pokoje Głosowe (Claim-to-Own)**:
+   - Kanał jest domyślnie widoczny dla każdego.
+   - Gdy wejdzie pierwsza osoba -> staje się **Gospodarzem** pokoju, a kanał natychmiast **znika dla innych użytkowników**.
+   - Wbudowany panel sterowania na czacie głosowym (przyciski, modale, listy wyboru):
+     - 👁️ **Ukryj / Pokaż** kanał dla reszty serwera
+     - 🔒 **Zablokuj / Odblokuj** dołączanie
+     - 👥 **Limit osób** (modal z polem liczbowym)
+     - ✏️ **Zmień nazwę kanału** (modal)
+     - 💬 **Zmień status kanału** (modal)
+     - 🔇 **Wycisz / Odcisz gości** (tryb wykładu/kinowy)
+     - ➕ **Zaproś znajomego** (menu wyboru użytkownika – nadaje natychmiastowy wstęp i widoczność)
+     - 🚫 **Wyrzuć i Zablokuj** (menu wyboru – odłącza i blokuje użytkownika)
+     - 👑 **Przekaż koronę** (przekazanie roli gospodarza innej osobie)
+     - 🔄 **Reset ustawień**
+   - Po wyjściu gospodarza: własność przejmuje **losowa osoba** z obecnych na kanale.
+   - Po wyjściu wszystkich osób: kanał jest **automatycznie resetowany** do stanu publicznego.
+   - Obsługa wielu kanałów przez zmienną `MANAGED_VOICE_CHANNEL_IDS` w `.env`.
+4. **Automatyczne Czyszczenie Kanału**: Co określony czas usuwa wiadomości starsze niż zadany limit na wskazanym kanale.
+5. **Komendy Moderacyjne**:
    - `/clear <ilość>` – natychmiastowe czyszczenie wiadomości (również starszych niż 14 dni).
    - `/stop` – zatrzymanie powolnego usuwania starych wiadomości.
    - `/autoclean <status>` – włączanie/wyłączanie automatycznego czyszczenia.
-5. **Działa 24/7 na Render**: Wbudowany serwer Express.js odpowiada na pingi zewnętrzne, dzięki czemu bot nie przechodzi w stan uśpienia.
-6. **Baza Danych PostgreSQL (Supabase) + SQLite**: Pełna trwałość danych bez ryzyka utraty godzin po restarcie.
+6. **Działa 24/7 na Render**: Wbudowany serwer Express.js odpowiada na pingi zewnętrzne, dzięki czemu bot nie przechodzi w stan uśpienia.
+7. **Baza Danych PostgreSQL (Supabase) + SQLite**: Pełna trwałość danych bez ryzyka utraty godzin po restarcie.
 
 ---
 

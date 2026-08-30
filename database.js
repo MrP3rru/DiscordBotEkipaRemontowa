@@ -250,8 +250,16 @@ async function initDatabase() {
         )
       `);
 
+      // Zabezpieczenie Supabase (Row Level Security - RLS)
+      // Blokuje nieautoryzowany dostęp przez publiczne API REST Supabase,
+      // jednocześnie pozwalając botowi (jako połączenie bezpośrednie Postgres) działać bez przeszkód.
+      await queryPg(`ALTER TABLE active_sessions ENABLE ROW LEVEL SECURITY`);
+      await queryPg(`ALTER TABLE user_times ENABLE ROW LEVEL SECURITY`);
+      await queryPg(`ALTER TABLE user_daily_times ENABLE ROW LEVEL SECURITY`);
+      await queryPg(`ALTER TABLE system_stats ENABLE ROW LEVEL SECURITY`);
+
       isPostgres = true;
-      console.log('✅ Pomyślnie połączono z bazą PostgreSQL (Supabase) i zaktualizowano tabele.');
+      console.log('✅ Pomyślnie połączono z bazą PostgreSQL (Supabase), zaktualizowano tabele i włączono RLS.');
       return;
     } catch (error) {
       console.error('❌ Błąd połączenia z PostgreSQL (Supabase):', error.message);

@@ -10,7 +10,13 @@ const {
   ButtonStyle,
   PermissionFlagsBits, 
   ApplicationCommandOptionType,
-  MessageFlags
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  UserSelectMenuBuilder,
+  StringSelectMenuBuilder,
+  ComponentType
 } = require('discord.js');
 const db = require('./database');
 
@@ -266,6 +272,9 @@ client.once('ready', async () => {
       } else {
         console.log(`[Diagnostyka] ❌ OSTRZEŻENIE: Kanał do czyszczenia o ID ${cleanChannelId} NIE jest widoczny dla bota! Sprawdź, czy ID jest poprawne i czy bot ma do niego dostęp.`);
       }
+
+      // Inicjalizacja zarządzanych kanałów głosowych (pokoi prywatnych)
+      await initManagedVoiceChannels(guild);
     } catch (err) {
       console.error('[Diagnostyka] Błąd pobierania danych o serwerze:', err.message);
     }
@@ -452,7 +461,759 @@ client.once('ready', async () => {
   startAutoCleanLoop();
 });
 
-// --- REJESTROWANIE CZASU NA KANAŁACH GŁOSOWYCH ---
+// ============================================================================
+// --- SYSTEM ZARZĄDZANIA PRYWATNYMI KANAŁAMI GŁOSOWYMI (CLAIM-TO-OWN) ---
+// ============================================================================
+
+// Pamięć podręczna stanu zarządzanych pokoi głosowych
+const managedRooms = new Map();
+
+// Pobranie listy ID skonfigurowanych kanałów zarządzanych z .env
+function getManagedVoiceChannelIds() {
+  const raw = process.env.MANAGED_VOICE_CHANNEL_IDS || '';
+  return raw
+    .split(',')
+    .map(id => id.trim())
+    .filter(id => id.length > 0 && id !== 'twoje_id_kanalu');
+}
+
+// Pobranie lub utworzenie obiektu stanu dla danego kanału
+function getOrCreateRoom(channel) {
+  if (!managedRooms.has(channel.id)) {
+    managedRooms.set(channel.id, {
+      channelId: channel.id,
+      guildId: channel.guild.id,
+      ownerId: null,
+      defaultName: channel.name || '🔊 Pokój Prywatny',
+      isPrivate: false,       // true = kanał ukryty dla @everyone
+      isLocked: false,        // true = zakaz dołączania dla @everyone
+      userLimit: channel.userLimit || 0,
+      isMutedGuests: false,   // true = goście mają zakaz mówienia
+      allowedUserIds: new Set(),
+      blockedUserIds: new Set(),
+      panelMessageId: null,
+      claimedAt: null
+    });
+  }
+  return managedRooms.get(channel.id);
+}
+
+// Bezpieczne ustawianie statusu głosowego kanału
+async function setVoiceChannelStatus(channel, statusText) {
+  try {
+    if (typeof channel.setStatus === 'function') {
+      await channel.setStatus(statusText || '');
+    } else if (client.rest) {
+      await client.rest.put(`/channels/${channel.id}/voice-status`, {
+        body: { status: statusText || '' }
+      }).catch(() => null);
+    }
+  } catch (err) {
+    // Ciche ignorowanie, jeśli funkcja nie jest wspierana na danym poziomie serwera
+  }
+}
+
+// Budowanie widoku Panelu Kontrolnego na czacie głosowym
+function buildRoomControlPanel(room, ownerMember) {
+  const ownerMention = ownerMember ? `<@${ownerMember.id}> (${ownerMember.displayName})` : 'Brak';
+  const visibilityText = room.isPrivate ? '🔒 **Ukryty** (Prywatny - tylko zaproszeni)' : '🌐 **Widoczny** (Publiczny dla każdego)';
+  const lockText = room.isLocked ? '⛔ **Zablokowany** (Zakaz wchodzenia)' : '🟢 **Otwarty** (Każdy może wejść)';
+  const limitText = room.userLimit > 0 ? `👥 **${room.userLimit}** osób` : '👥 **Brak limitu** (Nielimitowany)';
+  const speakText = room.isMutedGuests ? '🔇 **Wyciszeni goście** (Tylko gospodarz mówi)' : '🎙️ **Swobodna rozmowa** (Wszyscy mogą mówić)';
+
+  const embed = new EmbedBuilder()
+    .setColor('#5865F2')
+    .setTitle('🎛️ Panel Zarządzania Pokojem Głosowym')
+    .setDescription(
+      `Witaj na kanale! Jako aktualny **Gospodarz** masz pełną kontrolę nad tym pokojem.\n\n` +
+      `👑 **Gospodarz:** ${ownerMention}\n` +
+      `👁️ **Widoczność:** ${visibilityText}\n` +
+      `🚪 **Dostęp:** ${lockText}\n` +
+      `👥 **Limit miejsc:** ${limitText}\n` +
+      `🎤 **Tryb rozmowy:** ${speakText}\n\n` +
+      `*Użyj poniższych przycisków, aby szybko dostosować ustawienia pokoju:*`
+    )
+    .setFooter({ text: 'Ekipa Remontowa • Panel Pokoju Głosowego' })
+    .setTimestamp();
+
+  // Rząd 1: Ustawienia widoczności, blokady, limitu i nazwy
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_vis_${room.channelId}`)
+      .setLabel(room.isPrivate ? 'Pokaż kanał' : 'Ukryj kanał')
+      .setEmoji(room.isPrivate ? '👁️' : '🕶️')
+      .setStyle(room.isPrivate ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_lock_${room.channelId}`)
+      .setLabel(room.isLocked ? 'Odblokuj' : 'Zablokuj')
+      .setEmoji(room.isLocked ? '🔓' : '🔒')
+      .setStyle(room.isLocked ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_limit_${room.channelId}`)
+      .setLabel('Limit osób')
+      .setEmoji('👥')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_rename_${room.channelId}`)
+      .setLabel('Zmień nazwę')
+      .setEmoji('✏️')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_status_${room.channelId}`)
+      .setLabel('Status')
+      .setEmoji('💬')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  // Rząd 2: Zarządzanie ludźmi, wyciszaniem i resetem
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_mute_${room.channelId}`)
+      .setLabel(room.isMutedGuests ? 'Odcisz gości' : 'Wycisz gości')
+      .setEmoji(room.isMutedGuests ? '🔊' : '🔇')
+      .setStyle(room.isMutedGuests ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_invite_${room.channelId}`)
+      .setLabel('Zaproś')
+      .setEmoji('➕')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_kick_${room.channelId}`)
+      .setLabel('Wyrzuć')
+      .setEmoji('🚫')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_transfer_${room.channelId}`)
+      .setLabel('Przekaż koronę')
+      .setEmoji('👑')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`mv_btn_reset_${room.channelId}`)
+      .setLabel('Reset')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return { embeds: [embed], components: [row1, row2] };
+}
+
+// Synchronizacja uprawnień kanału Discord zgodnie ze stanem pokoju
+async function syncRoomPermissions(channel, room) {
+  try {
+    const overwrites = [];
+
+    // Uprawnienia Bota (zawsze pełna kontrola)
+    overwrites.push({
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.Speak,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.MoveMembers,
+        PermissionFlagsBits.MuteMembers,
+        PermissionFlagsBits.DeafenMembers,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    });
+
+    // Uprawnienia dla @everyone
+    const everyoneAllow = [];
+    const everyoneDeny = [];
+
+    if (room.isPrivate) {
+      everyoneDeny.push(PermissionFlagsBits.ViewChannel);
+    } else {
+      everyoneAllow.push(PermissionFlagsBits.ViewChannel);
+    }
+
+    if (room.isLocked) {
+      everyoneDeny.push(PermissionFlagsBits.Connect);
+    } else {
+      everyoneAllow.push(PermissionFlagsBits.Connect);
+    }
+
+    if (room.isMutedGuests) {
+      everyoneDeny.push(PermissionFlagsBits.Speak);
+    }
+
+    overwrites.push({
+      id: channel.guild.roles.everyone.id,
+      allow: everyoneAllow,
+      deny: everyoneDeny
+    });
+
+    // Uprawnienia Gospodarza (Właściciela)
+    if (room.ownerId) {
+      overwrites.push({
+        id: room.ownerId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak,
+          PermissionFlagsBits.MoveMembers,
+          PermissionFlagsBits.MuteMembers,
+          PermissionFlagsBits.DeafenMembers,
+          PermissionFlagsBits.SendMessages
+        ]
+      });
+    }
+
+    // Uprawnienia dla zaproszonych użytkowników (Biała lista)
+    for (const userId of room.allowedUserIds) {
+      if (userId === room.ownerId) continue;
+      overwrites.push({
+        id: userId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect,
+          ...(room.isMutedGuests ? [] : [PermissionFlagsBits.Speak])
+        ]
+      });
+    }
+
+    // Uprawnienia dla zablokowanych użytkowników (Czarna lista)
+    for (const userId of room.blockedUserIds) {
+      if (userId === room.ownerId) continue;
+      overwrites.push({
+        id: userId,
+        deny: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect
+        ]
+      });
+    }
+
+    await channel.permissionOverwrites.set(overwrites);
+  } catch (err) {
+    console.error(`[ManagedVoice] Błąd podczas synchronizacji uprawnień na kanale #${channel.name}:`, err.message);
+  }
+}
+
+// Przejęcie kanału przez pierwszego użytkownika
+async function claimRoom(channel, member) {
+  const room = getOrCreateRoom(channel);
+  room.ownerId = member.id;
+  room.isPrivate = true; // domyślnie ukryty dla reszty serwera
+  room.isLocked = false;
+  room.userLimit = 0;
+  room.isMutedGuests = false;
+  room.allowedUserIds.clear();
+  room.blockedUserIds.clear();
+  room.claimedAt = Date.now();
+
+  console.log(`[ManagedVoice] Użytkownik ${member.user.tag} został Gospodarzem kanału #${channel.name}.`);
+
+  // Aktualizacja nazwy i statusu
+  const targetName = `🔒 Kanał: ${member.displayName}`;
+  await channel.setName(targetName).catch(err => console.warn('[ManagedVoice] Nie udało się zmienić nazwy:', err.message));
+  await setVoiceChannelStatus(channel, `Gospodarz: ${member.displayName}`);
+
+  // Synchronizacja uprawnień (ukrycie kanału i nadanie praw twórcy)
+  await syncRoomPermissions(channel, room);
+
+  // Wysłanie panelu na czat głosowy
+  try {
+    const panelPayload = buildRoomControlPanel(room, member);
+    const msg = await channel.send({
+      content: `👋 Witaj <@${member.id}>! Zostałeś **Gospodarzem** tego pokoju głosowego.`,
+      ...panelPayload
+    });
+    room.panelMessageId = msg.id;
+  } catch (err) {
+    console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
+  }
+}
+
+// Przekazanie własności innemu użytkownikowi (automatyczne lub ręczne)
+async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true) {
+  const room = getOrCreateRoom(channel);
+  room.ownerId = newOwnerMember.id;
+  room.allowedUserIds.delete(newOwnerMember.id);
+
+  console.log(`[ManagedVoice] Gospodarz kanału #${channel.name} zmieniony na ${newOwnerMember.user.tag}.`);
+
+  const targetName = `🔒 Kanał: ${newOwnerMember.displayName}`;
+  await channel.setName(targetName).catch(() => null);
+  await setVoiceChannelStatus(channel, `Gospodarz: ${newOwnerMember.displayName}`);
+
+  await syncRoomPermissions(channel, room);
+
+  try {
+    const panelPayload = buildRoomControlPanel(room, newOwnerMember);
+    const reasonText = isAutomatic ? '(poprzedni gospodarz opuścił kanał)' : '(własność została przekazana)';
+    const msg = await channel.send({
+      content: `👑 **Nowy Gospodarz:** <@${newOwnerMember.id}> przejął zarządzanie tym pokojem ${reasonText}!`,
+      ...panelPayload
+    });
+    room.panelMessageId = msg.id;
+  } catch (err) {
+    console.error('[ManagedVoice] Błąd aktualizacji panelu po zmianie gospodarza:', err.message);
+  }
+}
+
+// Reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
+async function resetManagedRoom(channel) {
+  const room = getOrCreateRoom(channel);
+  room.ownerId = null;
+  room.isPrivate = false;
+  room.isLocked = false;
+  room.userLimit = 0;
+  room.isMutedGuests = false;
+  room.allowedUserIds.clear();
+  room.blockedUserIds.clear();
+  room.claimedAt = null;
+  room.panelMessageId = null;
+
+  console.log(`[ManagedVoice] Resetowanie kanału #${channel.name} do stanu początkowego.`);
+
+  // Przywrócenie domyślnej nazwy
+  if (room.defaultName && channel.name !== room.defaultName) {
+    await channel.setName(room.defaultName).catch(() => null);
+  }
+
+  // Usunięcie statusu głosowego
+  await setVoiceChannelStatus(channel, '');
+
+  // Reset limitu miejsc
+  if (channel.userLimit !== 0) {
+    await channel.setUserLimit(0).catch(() => null);
+  }
+
+  // Przywrócenie pełnej widoczności dla @everyone
+  try {
+    await channel.permissionOverwrites.set([
+      {
+        id: channel.guild.roles.everyone.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect]
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak,
+          PermissionFlagsBits.ManageChannels,
+          PermissionFlagsBits.MoveMembers,
+          PermissionFlagsBits.MuteMembers,
+          PermissionFlagsBits.SendMessages
+        ]
+      }
+    ]);
+  } catch (err) {
+    console.warn('[ManagedVoice] Błąd resetowania uprawnień:', err.message);
+  }
+}
+
+// Inicjalizacja zarządzanych kanałów przy starcie bota
+async function initManagedVoiceChannels(guild) {
+  const managedIds = getManagedVoiceChannelIds();
+  if (managedIds.length === 0) return;
+
+  console.log(`[ManagedVoice] Inicjalizacja ${managedIds.length} zarządzanych kanałów głosowych...`);
+  for (const chanId of managedIds) {
+    try {
+      const channel = await guild.channels.fetch(chanId).catch(() => null);
+      if (channel && channel.isVoiceBased()) {
+        const room = getOrCreateRoom(channel);
+        room.defaultName = channel.name;
+
+        const nonBots = channel.members.filter(m => !m.user.bot);
+        if (nonBots.size === 0) {
+          console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) jest pusty. Ustawiam stan domyślny.`);
+          await resetManagedRoom(channel);
+        } else {
+          const firstMember = nonBots.first();
+          console.log(`[ManagedVoice] Kanał #${channel.name} (${chanId}) ma obecnych użytkowników. Przypisuję gospodarza: ${firstMember.user.tag}.`);
+          await claimRoom(channel, firstMember);
+        }
+      } else {
+        console.warn(`[ManagedVoice] ⚠️ Kanał o ID ${chanId} nie istnieje lub nie jest kanałem głosowym!`);
+      }
+    } catch (err) {
+      console.warn(`[ManagedVoice] Błąd inicjalizacji kanału ${chanId}:`, err.message);
+    }
+  }
+}
+
+// Obsługa zdarzeń głosowych dla kanałów zarządzanych (Strict Isolation)
+async function handleManagedVoiceStateUpdate(oldState, newState) {
+  try {
+    const managedIds = getManagedVoiceChannelIds();
+    if (managedIds.length === 0) return;
+
+    const oldChannelId = oldState.channelId;
+    const newChannelId = newState.channelId;
+
+    const isOldManaged = oldChannelId && managedIds.includes(oldChannelId);
+    const isNewManaged = newChannelId && managedIds.includes(newChannelId);
+
+    // GWARANCJA BEZPIECZEŃSTWA: Jeżeli zdarzenie nie dotyczy żadnego zarządzanego kanału, natychmiast kończymy!
+    if (!isOldManaged && !isNewManaged) {
+      return;
+    }
+
+    const member = newState.member || oldState.member;
+    if (!member || member.user.bot) return;
+
+    // 1. Użytkownik wszedł na zarządzany kanał
+    if (isNewManaged && oldChannelId !== newChannelId) {
+      const channel = newState.channel;
+      if (channel) {
+        const room = getOrCreateRoom(channel);
+        const nonBotMembers = channel.members.filter(m => !m.user.bot);
+
+        if (!room.ownerId || nonBotMembers.size === 1) {
+          await claimRoom(channel, member);
+        } else if (room.isMutedGuests && member.id !== room.ownerId) {
+          await syncRoomPermissions(channel, room);
+        }
+      }
+    }
+
+    // 2. Użytkownik opuścił zarządzany kanał
+    if (isOldManaged && oldChannelId !== newChannelId) {
+      const channel = oldState.channel;
+      if (channel) {
+        const room = getOrCreateRoom(channel);
+        const remainingNonBots = channel.members.filter(m => !m.user.bot);
+
+        if (remainingNonBots.size === 0) {
+          await resetManagedRoom(channel);
+        } else if (room.ownerId === member.id) {
+          // Właściciel wyszedł, ale są inni ludzie -> losujemy nowego gospodarza
+          const candidates = Array.from(remainingNonBots.values());
+          const randomNewOwner = candidates[Math.floor(Math.random() * candidates.length)];
+          await transferRoomOwnership(channel, randomNewOwner, true);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[ManagedVoice] Błąd w handleManagedVoiceStateUpdate:', err.message);
+  }
+}
+
+// Obsługa interakcji z panelem prywatnego pokoju (Przyciski, Modale, Menu wyboru)
+async function handleManagedVoiceInteraction(interaction) {
+  const { customId, guild, user, member } = interaction;
+  if (!customId || !customId.startsWith('mv_')) return false;
+
+  try {
+    const parts = customId.split('_'); // np. ['mv', 'btn', 'vis', channelId] lub ['mv', 'modal', 'rename', channelId]
+    const actionType = parts[1]; // 'btn', 'modal', 'select'
+    const actionName = parts[2]; // 'vis', 'lock', 'limit', 'rename', 'status', 'mute', 'invite', 'kick', 'transfer', 'reset'
+    const channelId = parts.slice(3).join('_');
+
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel || !channel.isVoiceBased()) {
+      await interaction.reply({ content: 'Nie odnaleziono powiązanego kanału głosowego.', flags: [MessageFlags.Ephemeral] });
+      return true;
+    }
+
+    const room = getOrCreateRoom(channel);
+
+    // Sprawdzenie uprawnień: Tylko gospodarz lub Administrator serwera
+    const isOwner = room.ownerId === user.id;
+    const isAdmin = member.permissions.has(PermissionFlagsBits.Administrator);
+
+    if (!isOwner && !isAdmin) {
+      await interaction.reply({
+        content: `⛔ Tylko obecny **Gospodarz** tego kanału (${room.ownerId ? `<@${room.ownerId}>` : 'Brak'}) lub administrator może zmieniać jego ustawienia!`,
+        flags: [MessageFlags.Ephemeral]
+      });
+      return true;
+    }
+
+    const ownerMember = room.ownerId ? (channel.members.get(room.ownerId) || await guild.members.fetch(room.ownerId).catch(() => null)) : null;
+
+    // --- OBSŁUGA PRZYCISKÓW ---
+    if (actionType === 'btn') {
+      if (actionName === 'vis') {
+        room.isPrivate = !room.isPrivate;
+        await syncRoomPermissions(channel, room);
+        const panel = buildRoomControlPanel(room, ownerMember);
+        await interaction.update(panel);
+        return true;
+      }
+
+      if (actionName === 'lock') {
+        room.isLocked = !room.isLocked;
+        await syncRoomPermissions(channel, room);
+        const panel = buildRoomControlPanel(room, ownerMember);
+        await interaction.update(panel);
+        return true;
+      }
+
+      if (actionName === 'mute') {
+        room.isMutedGuests = !room.isMutedGuests;
+        await syncRoomPermissions(channel, room);
+        const panel = buildRoomControlPanel(room, ownerMember);
+        await interaction.update(panel);
+        return true;
+      }
+
+      if (actionName === 'reset') {
+        room.isPrivate = false;
+        room.isLocked = false;
+        room.userLimit = 0;
+        room.isMutedGuests = false;
+        room.allowedUserIds.clear();
+        room.blockedUserIds.clear();
+        await channel.setUserLimit(0).catch(() => null);
+        await syncRoomPermissions(channel, room);
+        const panel = buildRoomControlPanel(room, ownerMember);
+        await interaction.update(panel);
+        return true;
+      }
+
+      if (actionName === 'rename') {
+        const modal = new ModalBuilder()
+          .setCustomId(`mv_modal_rename_${channelId}`)
+          .setTitle('✏️ Zmień nazwę pokoju głosowego');
+
+        const input = new TextInputBuilder()
+          .setCustomId('mv_input_name')
+          .setLabel('Nowa nazwa kanału')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('np. 🎮 Pokój graczy')
+          .setValue(channel.name)
+          .setMaxLength(32)
+          .setRequired(true);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return true;
+      }
+
+      if (actionName === 'limit') {
+        const modal = new ModalBuilder()
+          .setCustomId(`mv_modal_limit_${channelId}`)
+          .setTitle('👥 Ustaw limit osób w pokoju');
+
+        const input = new TextInputBuilder()
+          .setCustomId('mv_input_limit')
+          .setLabel('Limit osób (0 = brak limitu, max 99)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('np. 5')
+          .setValue(room.userLimit.toString())
+          .setMaxLength(2)
+          .setRequired(true);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return true;
+      }
+
+      if (actionName === 'status') {
+        const modal = new ModalBuilder()
+          .setCustomId(`mv_modal_status_${channelId}`)
+          .setTitle('💬 Zmień status kanału głosowego');
+
+        const input = new TextInputBuilder()
+          .setCustomId('mv_input_status')
+          .setLabel('Status pokoju (np. Gramy w CS2)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Wpisz status pokoju...')
+          .setMaxLength(500)
+          .setRequired(false);
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return true;
+      }
+
+      if (actionName === 'invite') {
+        const selectMenu = new UserSelectMenuBuilder()
+          .setCustomId(`mv_select_invite_${channelId}`)
+          .setPlaceholder('🔍 Wybierz użytkownika, którego chcesz zaprosić...')
+          .setMinValues(1)
+          .setMaxValues(1);
+
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+        await interaction.reply({
+          content: '➕ **Zaproś znajomego:** Wybierz osobę, która ma otrzymać dostęp do Twojego prywatnego pokoju:',
+          components: [row],
+          flags: [MessageFlags.Ephemeral]
+        });
+        return true;
+      }
+
+      if (actionName === 'kick') {
+        const selectMenu = new UserSelectMenuBuilder()
+          .setCustomId(`mv_select_kick_${channelId}`)
+          .setPlaceholder('🚫 Wybierz użytkownika do wyrzucenia/zablokowania...')
+          .setMinValues(1)
+          .setMaxValues(1);
+
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+        await interaction.reply({
+          content: '🚫 **Wyrzuć i Zablokuj:** Wybierz osobę, którą chcesz odłączyć od kanału i zablokować przed wstępem:',
+          components: [row],
+          flags: [MessageFlags.Ephemeral]
+        });
+        return true;
+      }
+
+      if (actionName === 'transfer') {
+        const selectMenu = new UserSelectMenuBuilder()
+          .setCustomId(`mv_select_transfer_${channelId}`)
+          .setPlaceholder('👑 Wybierz nowego gospodarza kanału...')
+          .setMinValues(1)
+          .setMaxValues(1);
+
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+        await interaction.reply({
+          content: '👑 **Przekaż Koronę:** Wybierz osobę, która ma zostać nowym Gospodarzem tego pokoju:',
+          components: [row],
+          flags: [MessageFlags.Ephemeral]
+        });
+        return true;
+      }
+    }
+
+    // --- OBSŁUGA MODALI ---
+    if (actionType === 'modal') {
+      if (actionName === 'rename') {
+        const newName = interaction.fields.getTextInputValue('mv_input_name').trim();
+        if (!newName) {
+          await interaction.reply({ content: 'Nazwa nie może być pusta.', flags: [MessageFlags.Ephemeral] });
+          return true;
+        }
+
+        try {
+          await channel.setName(newName);
+          await interaction.reply({ content: `✅ Nazwa kanału została zmieniona na: **${newName}**`, flags: [MessageFlags.Ephemeral] });
+        } catch (err) {
+          await interaction.reply({
+            content: `⚠️ Nie udało się zmienić nazwy. Discord ogranicza częstą zmianę nazwy kanału (maks. 2 razy na 10 minut).`,
+            flags: [MessageFlags.Ephemeral]
+          });
+        }
+        return true;
+      }
+
+      if (actionName === 'limit') {
+        const limitRaw = interaction.fields.getTextInputValue('mv_input_limit').trim();
+        const limitNum = parseInt(limitRaw, 10);
+
+        if (isNaN(limitNum) || limitNum < 0 || limitNum > 99) {
+          await interaction.reply({ content: 'Podaj poprawną liczbę od 0 do 99 (gdzie 0 to brak limitu).', flags: [MessageFlags.Ephemeral] });
+          return true;
+        }
+
+        room.userLimit = limitNum;
+        await channel.setUserLimit(limitNum).catch(() => null);
+
+        // Odśwież widok panelu jeśli wiadomość istnieje
+        try {
+          if (room.panelMessageId) {
+            const panelMsg = await channel.messages.fetch(room.panelMessageId).catch(() => null);
+            if (panelMsg) {
+              const panel = buildRoomControlPanel(room, ownerMember);
+              await panelMsg.edit(panel);
+            }
+          }
+        } catch (_) {}
+
+        await interaction.reply({
+          content: `✅ Limit osób został ustawiony na: **${limitNum === 0 ? 'Brak limitu' : `${limitNum} osób`}**`,
+          flags: [MessageFlags.Ephemeral]
+        });
+        return true;
+      }
+
+      if (actionName === 'status') {
+        const newStatus = interaction.fields.getTextInputValue('mv_input_status').trim();
+        await setVoiceChannelStatus(channel, newStatus);
+        await interaction.reply({
+          content: `✅ Status głosowy kanału został zaktualizowany na: **${newStatus || '(wyczyszczony)'}**`,
+          flags: [MessageFlags.Ephemeral]
+        });
+        return true;
+      }
+    }
+
+    // --- OBSŁUGA MENU WYBORU (USER SELECT) ---
+    if (actionType === 'select') {
+      const targetUserId = interaction.values[0];
+
+      if (actionName === 'invite') {
+        room.allowedUserIds.add(targetUserId);
+        room.blockedUserIds.delete(targetUserId);
+        await syncRoomPermissions(channel, room);
+
+        await interaction.update({
+          content: `✅ Pomyślnie nadano dostęp i widoczność dla użytkownika <@${targetUserId}>!`,
+          components: []
+        });
+        return true;
+      }
+
+      if (actionName === 'kick') {
+        if (targetUserId === room.ownerId) {
+          await interaction.update({
+            content: `❌ Nie możesz wyrzucić samego siebie!`,
+            components: []
+          });
+          return true;
+        }
+
+        room.blockedUserIds.add(targetUserId);
+        room.allowedUserIds.delete(targetUserId);
+        await syncRoomPermissions(channel, room);
+
+        // Rozłączenie użytkownika z kanału jeśli jest połączony
+        const targetMember = channel.members.get(targetUserId);
+        if (targetMember && targetMember.voice) {
+          await targetMember.voice.disconnect().catch(() => null);
+        }
+
+        await interaction.update({
+          content: `🚫 Użytkownik <@${targetUserId}> został wyrzucony i zablokowany przed wejściem na ten kanał.`,
+          components: []
+        });
+        return true;
+      }
+
+      if (actionName === 'transfer') {
+        if (targetUserId === room.ownerId) {
+          await interaction.update({
+            content: `ℹ️ Ten użytkownik jest już Gospodarzem tego pokoju!`,
+            components: []
+          });
+          return true;
+        }
+
+        const targetMember = channel.members.get(targetUserId) || await guild.members.fetch(targetUserId).catch(() => null);
+        if (!targetMember) {
+          await interaction.update({
+            content: `❌ Nie znaleziono wybranego użytkownika.`,
+            components: []
+          });
+          return true;
+        }
+
+        await transferRoomOwnership(channel, targetMember, false);
+        await interaction.update({
+          content: `👑 Pomyślnie przekazano rolę Gospodarza użytkownikowi <@${targetUserId}>!`,
+          components: []
+        });
+        return true;
+      }
+    }
+
+    return true;
+  } catch (err) {
+    console.error('[ManagedVoice] Błąd podczas obsługi interakcji:', err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Wystąpił błąd podczas wykonywania tej akcji.', flags: [MessageFlags.Ephemeral] }).catch(() => null);
+    }
+    return true;
+  }
+}
+
+// --- REJESTROWANIE CZASU NA KANAŁACH GŁOSOWYCH & OBSŁUGA POKOI PRYWATNYCH ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
     const member = newState.member || oldState.member;
@@ -476,15 +1237,22 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       await db.startVoiceSession(userId, guildId, newState.channelId);
       console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
     }
+
+    // Obsługa prywatnych/zarządzanych kanałów głosowych (Claim-to-Own)
+    await handleManagedVoiceStateUpdate(oldState, newState);
   } catch (err) {
     console.error('Błąd w zdarzeniu voiceStateUpdate:', err.message);
   }
 });
 
-// --- OBSŁUGA INTERAKCJI (KOMEND SLASH I PRZYCISKÓW) ---
+// --- OBSŁUGA INTERAKCJI (KOMEND SLASH, PRZYCISKÓW, MODALI, MENU) ---
 client.on('interactionCreate', async (interaction) => {
   try {
-    // 1. OBSŁUGA PRZYCISKÓW PAGINACJI LEADERBOARD
+    // 1. OBSŁUGA INTERAKCJI POKOJU PRYWATNEGO (Przycisk, Modal, SelectMenu)
+    const isManagedVoice = await handleManagedVoiceInteraction(interaction);
+    if (isManagedVoice) return;
+
+    // 2. OBSŁUGA PRZYCISKÓW PAGINACJI LEADERBOARD
     if (interaction.isButton()) {
       const { customId, guildId } = interaction;
       if (customId.startsWith('lb_prev_') || customId.startsWith('lb_next_')) {
