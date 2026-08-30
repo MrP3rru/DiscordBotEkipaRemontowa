@@ -848,12 +848,14 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
 }
 
 
-// Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
+// Resetowanie kanału do stanu wyjściowego z blokadą wejścia na czas czyszczenia
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
+  if (room.isResetting) return;
+  room.isResetting = true;
   room.ownerId = null;
   room.isPrivate = false;
-  room.isLocked = false;
+  room.isLocked = true;
   room.userLimit = 0;
   room.isMutedGuests = false;
   room.allowedUserIds.clear();
@@ -862,15 +864,46 @@ async function resetManagedRoom(channel) {
   room.panelMessageId = null;
 
   const defaultName = '🔊 Zamów prywatny kanał 🔏';
-  console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
+  console.log(`[ManagedVoice] 🔒 Blokowanie kanału #${channel.name} i resetowanie do stanu początkowego...`);
 
-  await Promise.allSettled([
-    channel.edit({ 
-      name: defaultName, 
-      userLimit: 0 
-    }).catch(() => null),
-    setVoiceChannelStatus(channel, null),
-    channel.permissionOverwrites.set([
+  try {
+    // Krok 1: Natychmiastowe zablokowanie wejścia (@everyone: deny Connect) na czas czyszczenia
+    await channel.permissionOverwrites.set([
+      {
+        id: channel.guild.roles.everyone.id,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
+        deny: [PermissionFlagsBits.Connect] // ZABLOKOWANE WEJŚCIE PODCZAS RESETU
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak,
+          PermissionFlagsBits.ManageChannels,
+          PermissionFlagsBits.ManageRoles,
+          PermissionFlagsBits.MoveMembers,
+          PermissionFlagsBits.MuteMembers,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.EmbedLinks
+        ],
+        deny: []
+      }
+    ]).catch(() => null);
+
+    // Krok 2: Wyczyszczenie czatu, przywrócenie nazwy domyślnej i wyzerowanie statusu
+    await Promise.allSettled([
+      channel.edit({ 
+        name: defaultName, 
+        userLimit: 0 
+      }).catch(() => null),
+      setVoiceChannelStatus(channel, null),
+      cleanChannelChat(channel)
+    ]);
+
+    // Krok 3: Po zakończeniu czyszczenia odblokowanie wejścia dla każdego
+    await channel.permissionOverwrites.set([
       {
         id: channel.guild.roles.everyone.id,
         allow: [
@@ -898,12 +931,18 @@ async function resetManagedRoom(channel) {
         ],
         deny: []
       }
-    ]).catch(() => null),
-    cleanChannelChat(channel)
-  ]);
+    ]).catch(() => null);
 
-  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został zresetowany i jest w pełni gotowy do użycia.`);
+    room.isLocked = false;
+    room.isResetting = false;
+    console.log(`[ManagedVoice] ✅ Reset zakończony. Kanał #${defaultName} został odblokowany i jest gotowy do użytku.`);
+  } catch (err) {
+    room.isLocked = false;
+    room.isResetting = false;
+    console.error('[ManagedVoice] Błąd podczas resetu kanału:', err);
+  }
 }
+
 
 
 
