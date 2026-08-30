@@ -551,31 +551,43 @@ async function setVoiceChannelStatus(channel, statusText) {
   }
 }
 
-// Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium, Ultra-Czytelny UI)
+// Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium, Ultra-Czytelny UI z polami)
 function buildRoomControlPanel(room, ownerMember, channel = null) {
   const ownerMention = ownerMember ? `<@${ownerMember.id}>` : 'Brak';
   const membersCount = channel ? channel.members.filter(m => !m.user.bot).size : 1;
-  const limitDisplay = room.userLimit > 0 ? `**${membersCount} / ${room.userLimit}** osób` : `**${membersCount}** (brak limitu)`;
+  const limitDisplay = room.userLimit > 0 ? `${membersCount} / ${room.userLimit} osób` : `${membersCount} (brak limitu)`;
 
   const visBadge = room.isPrivate ? '🔴 `Ukryty (Prywatny)`' : '🟢 `Widoczny (Publiczny)`';
-  const lockBadge = room.isLocked ? '🔴 `Zablokowany (Klucz)`' : '🟢 `Otwarty (Dla każdego)`';
-  const micBadge = room.isMutedGuests ? '🔴 `Tylko Gospodarz mówi`' : '🟢 `Swobodna rozmowa`';
+  const lockBadge = room.isLocked ? '🔴 `Zablokowany`' : '🟢 `Wstęp Wolny`';
+  const micBadge = room.isMutedGuests ? '🔴 `Tylko Gospodarz`' : '🟢 `Swobodna rozmowa`';
 
   const embed = new EmbedBuilder()
     .setColor(room.isPrivate ? '#ED4245' : '#5865F2')
-    .setTitle('🎛️ PANEL DOWODZENIA POKOJEM')
+    .setTitle('🎛️ PANEL DOWODZENIA POKOJEM GŁOSOWYM')
     .setDescription(
-      `👑 **Gospodarz:** ${ownerMention}\n` +
-      `👥 **Obecni w pokoju:** ${limitDisplay}\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `⚙️ **STATUS POKOJU**\n` +
-      `• 👁️ **Widoczność:** ${visBadge}\n` +
-      `• 🚪 **Dostęp do wejścia:** ${lockBadge}\n` +
-      `• 🎙️ **Mikrofony gości:** ${micBadge}\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `*Kliknij wybrany przycisk poniżej, aby zmienić ustawienia:*`
+      `Witaj w centrum zarządzania swoim pokojem głosowym!\n\n` +
+      `👑 **Gospodarz pokoju:** ${ownerMention}\n` +
+      `👥 **Osoby na kanale:** \`${limitDisplay}\`\n` +
+      `\u200b`
     )
-    .setFooter({ text: 'Ekipa Remontowa • Pokój Prywatny' });
+    .addFields(
+      {
+        name: '👁️ Widoczność',
+        value: `> ${visBadge}`,
+        inline: true
+      },
+      {
+        name: '🚪 Dostęp do pokoju',
+        value: `> ${lockBadge}`,
+        inline: true
+      },
+      {
+        name: '🎙️ Mikrofony gości',
+        value: `> ${micBadge}`,
+        inline: true
+      }
+    )
+    .setFooter({ text: 'Ekipa Remontowa • Kliknij przycisk poniżej, aby zarządzać' });
 
   // Rząd 1: Ustawienia pokoju (5 zwięzłych przycisków w jednym rzędzie)
   const row1 = new ActionRowBuilder().addComponents(
