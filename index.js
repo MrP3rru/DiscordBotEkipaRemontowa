@@ -514,19 +514,21 @@ async function setVoiceChannelStatus(channel, statusText) {
   }
 }
 
-// Czyszczenie starych wiadomości bota na czacie kanału głosowego
+// Czyszczenie wszystkich wiadomości na czacie kanału głosowego
 async function cleanChannelChat(channel) {
   try {
-    const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
     if (!messages || messages.size === 0) return;
-    const botMessages = messages.filter(m => m.author.id === client.user.id);
-    if (botMessages.size > 0) {
-      if (typeof channel.bulkDelete === 'function') {
-        await channel.bulkDelete(botMessages, true).catch(() => null);
-      } else {
-        for (const msg of botMessages.values()) {
-          await msg.delete().catch(() => null);
-        }
+
+    if (typeof channel.bulkDelete === 'function') {
+      await channel.bulkDelete(messages, true).catch(() => null);
+    }
+    
+    // Usunięcie ewentualnych pozostałych wiadomości
+    const remaining = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (remaining && remaining.size > 0) {
+      for (const msg of remaining.values()) {
+        await msg.delete().catch(() => null);
       }
     }
   } catch (err) {
@@ -549,52 +551,52 @@ async function setVoiceChannelStatus(channel, statusText) {
   }
 }
 
-// Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium UI)
+// Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium, Ultra-Czytelny UI)
 function buildRoomControlPanel(room, ownerMember, channel = null) {
-  const ownerMention = ownerMember ? `<@${ownerMember.id}> (${ownerMember.displayName})` : 'Brak';
+  const ownerMention = ownerMember ? `<@${ownerMember.id}>` : 'Brak';
   const membersCount = channel ? channel.members.filter(m => !m.user.bot).size : 1;
-  const limitDisplay = room.userLimit > 0 ? `👥 **${membersCount} / ${room.userLimit}** osób` : `👥 **${membersCount}** (brak limitu)`;
+  const limitDisplay = room.userLimit > 0 ? `**${membersCount} / ${room.userLimit}** osób` : `**${membersCount}** (brak limitu)`;
 
-  const visBadge = room.isPrivate ? '🔴 `[ 🔒 UKRYTY - PRYWATNY ]`' : '🟢 `[ 🌐 WIDOCZNY - PUBLICZNY ]`';
-  const lockBadge = room.isLocked ? '🔴 `[ ⛔ ZABLOKOWANY ]`' : '🟢 `[ 🔓 OTWARTY DLA WSZYSTKICH ]`';
-  const micBadge = room.isMutedGuests ? '🔴 `[ 🔇 TYLKO GOSPODARZ MÓWI ]`' : '🟢 `[ 🎙️ SWOBODNA ROZMOWA ]`';
+  const visBadge = room.isPrivate ? '🔴 `Ukryty (Prywatny)`' : '🟢 `Widoczny (Publiczny)`';
+  const lockBadge = room.isLocked ? '🔴 `Zablokowany (Klucz)`' : '🟢 `Otwarty (Dla każdego)`';
+  const micBadge = room.isMutedGuests ? '🔴 `Tylko Gospodarz mówi`' : '🟢 `Swobodna rozmowa`';
 
   const embed = new EmbedBuilder()
     .setColor(room.isPrivate ? '#ED4245' : '#5865F2')
-    .setTitle('🎛️ PANEL DOWODZENIA POKOJEM GŁOSOWYM')
+    .setTitle('🎛️ PANEL DOWODZENIA POKOJEM')
     .setDescription(
-      `Witaj w centrum zarządzania swoim pokojem głosowym! Jako **Gospodarz** możesz swobodnie nim sterować.\n\n` +
-      `👑 **Gospodarz pokoju:** ${ownerMention}\n` +
+      `👑 **Gospodarz:** ${ownerMention}\n` +
       `👥 **Obecni w pokoju:** ${limitDisplay}\n\n` +
-      `**AKTUALNY STAN POKOJU:**\n` +
-      `> 👁️ **Widoczność:** ${visBadge}\n` +
-      `> 🚪 **Dostęp do pokoju:** ${lockBadge}\n` +
-      `> 🎤 **Mikrofony gości:** ${micBadge}\n\n` +
-      `*Kliknij wybrany przycisk poniżej, aby natychmiast zmienić ustawienie:*`
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `⚙️ **STATUS POKOJU**\n` +
+      `• 👁️ **Widoczność:** ${visBadge}\n` +
+      `• 🚪 **Dostęp do wejścia:** ${lockBadge}\n` +
+      `• 🎙️ **Mikrofony gości:** ${micBadge}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `*Kliknij wybrany przycisk poniżej, aby zmienić ustawienia:*`
     )
-    .setFooter({ text: 'Ekipa Remontowa • Pokój Prywatny • Sterowanie' })
-    .setTimestamp();
+    .setFooter({ text: 'Ekipa Remontowa • Pokój Prywatny' });
 
-  // Rząd 1: Główne przełączniki i modale
+  // Rząd 1: Ustawienia pokoju (5 zwięzłych przycisków w jednym rzędzie)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`mv_btn_vis_${room.channelId}`)
-      .setLabel(room.isPrivate ? 'Pokaż kanał' : 'Ukryj kanał')
+      .setLabel(room.isPrivate ? 'Odkryj' : 'Ukryj')
       .setEmoji(room.isPrivate ? '👁️' : '🕶️')
       .setStyle(room.isPrivate ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_lock_${room.channelId}`)
-      .setLabel(room.isLocked ? 'Odblokuj wejście' : 'Zablokuj wejście')
+      .setLabel(room.isLocked ? 'Otwórz' : 'Zamknij')
       .setEmoji(room.isLocked ? '🔓' : '🔒')
       .setStyle(room.isLocked ? ButtonStyle.Success : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_limit_${room.channelId}`)
-      .setLabel('Limit osób')
+      .setLabel('Limit')
       .setEmoji('👥')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_rename_${room.channelId}`)
-      .setLabel('Zmień nazwę')
+      .setLabel('Nazwa')
       .setEmoji('✏️')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
@@ -604,37 +606,38 @@ function buildRoomControlPanel(room, ownerMember, channel = null) {
       .setStyle(ButtonStyle.Primary)
   );
 
-  // Rząd 2: Ludzie, wyciszanie i reset
+  // Rząd 2: Ludzie, wyciszanie i reset (5 zwięzłych przycisków w drugim rzędzie)
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`mv_btn_mute_${room.channelId}`)
-      .setLabel(room.isMutedGuests ? 'Odcisz gości' : 'Wycisz gości')
+      .setLabel(room.isMutedGuests ? 'Odcisz' : 'Wycisz')
       .setEmoji(room.isMutedGuests ? '🔊' : '🔇')
       .setStyle(room.isMutedGuests ? ButtonStyle.Success : ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId(`mv_btn_invite_${room.channelId}`)
-      .setLabel('Zaproś znajomego')
+      .setLabel('Zaproś')
       .setEmoji('➕')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`mv_btn_kick_${room.channelId}`)
-      .setLabel('Wyrzuć / Zablokuj')
+      .setLabel('Wyrzuć')
       .setEmoji('🚫')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId(`mv_btn_transfer_${room.channelId}`)
-      .setLabel('Przekaż koronę')
+      .setLabel('Korona')
       .setEmoji('👑')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`mv_btn_reset_${room.channelId}`)
-      .setLabel('Resetuj pokój')
+      .setLabel('Reset')
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Secondary)
   );
 
   return { embeds: [embed], components: [row1, row2] };
 }
+
 
 // Odświeżenie wiadomości panelu na czacie kanału
 async function refreshPanelMessage(channel, room, ownerMember) {
