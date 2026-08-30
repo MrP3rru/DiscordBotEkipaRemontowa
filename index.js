@@ -525,20 +525,25 @@ async function cleanChannelChat(channel, preserveMessageId = null) {
   }
 }
 
-// Bezpieczne ustawianie statusu głosowego kanału
+// Bezpieczne ustawianie statusu głosowego kanału (Discord API wymaga status: null przy czyszczeniu)
 async function setVoiceChannelStatus(channel, statusText) {
   try {
+    const statusPayload = (statusText && typeof statusText === 'string' && statusText.trim().length > 0) 
+      ? statusText.trim() 
+      : null;
+
     if (typeof channel.setStatus === 'function') {
-      await channel.setStatus(statusText || '');
+      await channel.setStatus(statusPayload).catch(() => null);
     } else if (client.rest) {
       await client.rest.put(`/channels/${channel.id}/voice-status`, {
-        body: { status: statusText || '' }
+        body: { status: statusPayload }
       }).catch(() => null);
     }
   } catch (err) {
-    // Ciche ignorowanie, jeśli funkcja nie jest wspierana
+    // Ciche ignorowanie
   }
 }
+
 
 
 // Budowanie widoku Panelu Kontrolnego na czacie głosowym (Premium, Ultra-Czytelny UI z polami)
@@ -843,12 +848,12 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
 }
 
 
-// Resetowanie kanału do stanu wyjściowego z animacją i chwilową blokadą
+// Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
 async function resetManagedRoom(channel) {
   const room = getOrCreateRoom(channel);
   room.ownerId = null;
   room.isPrivate = false;
-  room.isLocked = true; // Chwilowa blokada w pamięci
+  room.isLocked = false;
   room.userLimit = 0;
   room.isMutedGuests = false;
   room.allowedUserIds.clear();
@@ -856,54 +861,15 @@ async function resetManagedRoom(channel) {
   room.claimedAt = null;
   room.panelMessageId = null;
 
-  console.log(`[ManagedVoice] 🔄 Rozpoczynam resetowanie kanału #${channel.name}...`);
-
-  // Krok 1: Chwilowe zablokowanie wejścia, zmiana nazwy i statusu na informację o resecie
-  await Promise.allSettled([
-    channel.edit({ 
-      name: '🔄 Resetowanie kanału...', 
-      userLimit: 0 
-    }).catch(() => null),
-    setVoiceChannelStatus(channel, '⏳ Trwa resetowanie pokoju...'),
-    channel.permissionOverwrites.set([
-      {
-        id: channel.guild.roles.everyone.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory],
-        deny: [PermissionFlagsBits.Connect] // Zablokowanie dołączania podczas czyszczenia
-      },
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.Connect,
-          PermissionFlagsBits.Speak,
-          PermissionFlagsBits.ManageChannels,
-          PermissionFlagsBits.ManageRoles,
-          PermissionFlagsBits.MoveMembers,
-          PermissionFlagsBits.MuteMembers,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.EmbedLinks
-        ],
-        deny: []
-      }
-    ]).catch(() => null),
-    cleanChannelChat(channel)
-  ]);
-
-  // Krótkie opóźnienie (1.2 sekundy), aby czyszczenie przebiegło płynnie
-  await new Promise(resolve => setTimeout(resolve, 1200));
-
-  // Krok 2: Przywrócenie domyślnej nazwy, odblokowanie wejścia dla każdego i wyczyszczenie statusu
-  room.isLocked = false;
-  const defaultName = room.defaultName || '🔊 Zamów prywatny kanał 🔏';
+  const defaultName = '🔊 Zamów prywatny kanał 🔏';
+  console.log(`[ManagedVoice] ⚡ Błyskawiczny reset kanału #${channel.name} do stanu początkowego.`);
 
   await Promise.allSettled([
     channel.edit({ 
       name: defaultName, 
       userLimit: 0 
     }).catch(() => null),
-    setVoiceChannelStatus(channel, ''),
+    setVoiceChannelStatus(channel, null),
     channel.permissionOverwrites.set([
       {
         id: channel.guild.roles.everyone.id,
@@ -932,11 +898,13 @@ async function resetManagedRoom(channel) {
         ],
         deny: []
       }
-    ]).catch(() => null)
+    ]).catch(() => null),
+    cleanChannelChat(channel)
   ]);
 
-  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został pomyślnie zresetowany i jest w pełni otwarty dla każdego!`);
+  console.log(`[ManagedVoice] ✅ Kanał #${defaultName} został zresetowany i jest w pełni gotowy do użycia.`);
 }
+
 
 
 // Inicjalizacja zarządzanych kanałów przy starcie bota
