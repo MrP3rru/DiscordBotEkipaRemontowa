@@ -16,7 +16,8 @@ const {
   TextInputStyle,
   UserSelectMenuBuilder,
   StringSelectMenuBuilder,
-  ComponentType
+  ComponentType,
+  Events
 } = require('discord.js');
 const db = require('./database');
 
@@ -247,7 +248,7 @@ async function buildLeaderboardView(guildId, period = 'all', page = 1) {
 }
 
 // Obsługa uruchomienia bota
-client.once('ready', async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Zalogowano jako ${client.user.tag}!`);
 
   // Inicjalizacja bazy danych
@@ -667,6 +668,7 @@ async function syncRoomPermissions(channel, room) {
         PermissionFlagsBits.MuteMembers,
         PermissionFlagsBits.DeafenMembers,
         PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
         PermissionFlagsBits.EmbedLinks
       ]
     });
@@ -709,7 +711,10 @@ async function syncRoomPermissions(channel, room) {
           PermissionFlagsBits.MoveMembers,
           PermissionFlagsBits.MuteMembers,
           PermissionFlagsBits.DeafenMembers,
-          PermissionFlagsBits.SendMessages
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.AttachFiles
         ]
       });
     }
@@ -717,7 +722,12 @@ async function syncRoomPermissions(channel, room) {
     // Uprawnienia dla zaproszonych użytkowników (Biała lista)
     for (const userId of room.allowedUserIds) {
       if (userId === room.ownerId) continue;
-      const allowPerms = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect];
+      const allowPerms = [
+        PermissionFlagsBits.ViewChannel, 
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory
+      ];
       const denyPerms = [];
       if (room.isMutedGuests) {
         denyPerms.push(PermissionFlagsBits.Speak);
@@ -778,12 +788,16 @@ async function claimRoom(channel, member) {
   // Wysłanie nowego panelu na czat głosowy
   try {
     const panelPayload = buildRoomControlPanel(room, member, channel);
-    const msg = await channel.send(panelPayload);
+    const msg = await channel.send({
+      content: `👋 Witaj <@${member.id}>! Oto Twój prywatny panel kontrolny pokoju:`,
+      ...panelPayload
+    });
     room.panelMessageId = msg.id;
   } catch (err) {
     console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
   }
 }
+
 
 // Przekazanie własności innemu użytkownikowi (automatyczne lub ręczne)
 async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true) {
@@ -999,22 +1013,25 @@ async function handleManagedVoiceInteraction(interaction) {
     // --- OBSŁUGA PRZYCISKÓW ---
     if (actionType === 'btn') {
       if (actionName === 'vis') {
+        await interaction.deferUpdate().catch(() => null);
         room.isPrivate = !room.isPrivate;
         await syncRoomPermissions(channel, room);
         const panel = buildRoomControlPanel(room, ownerMember, channel);
-        await interaction.update(panel);
+        await interaction.editReply(panel).catch(() => null);
         return true;
       }
 
       if (actionName === 'lock') {
+        await interaction.deferUpdate().catch(() => null);
         room.isLocked = !room.isLocked;
         await syncRoomPermissions(channel, room);
         const panel = buildRoomControlPanel(room, ownerMember, channel);
-        await interaction.update(panel);
+        await interaction.editReply(panel).catch(() => null);
         return true;
       }
 
       if (actionName === 'mute') {
+        await interaction.deferUpdate().catch(() => null);
         room.isMutedGuests = !room.isMutedGuests;
         
         // Aktywny serwerowy mute / unmute wszystkich obecnych gości
@@ -1025,11 +1042,12 @@ async function handleManagedVoiceInteraction(interaction) {
 
         await syncRoomPermissions(channel, room);
         const panel = buildRoomControlPanel(room, ownerMember, channel);
-        await interaction.update(panel);
+        await interaction.editReply(panel).catch(() => null);
         return true;
       }
 
       if (actionName === 'reset') {
+        await interaction.deferUpdate().catch(() => null);
         room.isPrivate = false;
         room.isLocked = false;
         room.userLimit = 0;
@@ -1046,7 +1064,7 @@ async function handleManagedVoiceInteraction(interaction) {
         await channel.edit({ userLimit: 0 }).catch(() => null);
         await syncRoomPermissions(channel, room);
         const panel = buildRoomControlPanel(room, ownerMember, channel);
-        await interaction.update(panel);
+        await interaction.editReply(panel).catch(() => null);
         return true;
       }
 
@@ -1204,15 +1222,16 @@ async function handleManagedVoiceInteraction(interaction) {
           return true;
         }
 
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => null);
+
         try {
           await channel.edit({ name: newName });
           await refreshPanelMessage(channel, room, ownerMember);
-          await interaction.reply({ content: `✅ Nazwa kanału została zmieniona na: **${newName}**`, flags: [MessageFlags.Ephemeral] });
+          await interaction.editReply({ content: `✅ Nazwa kanału została zmieniona na: **${newName}**` }).catch(() => null);
         } catch (err) {
-          await interaction.reply({
-            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Discord ogranicza zbyt częstą zmianę nazwy kanału (maks. 2 razy na 10 minut).`,
-            flags: [MessageFlags.Ephemeral]
-          });
+          await interaction.editReply({
+            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Discord ogranicza zbyt częstą zmianę nazwy kanału (maks. 2 razy na 10 minut).`
+          }).catch(() => null);
         }
         return true;
       }
@@ -1226,6 +1245,8 @@ async function handleManagedVoiceInteraction(interaction) {
           return true;
         }
 
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => null);
+
         room.userLimit = limitNum;
         try {
           await channel.edit({ userLimit: limitNum });
@@ -1235,21 +1256,21 @@ async function handleManagedVoiceInteraction(interaction) {
 
         await refreshPanelMessage(channel, room, ownerMember);
 
-        await interaction.reply({
-          content: `✅ Limit osób na kanale został ustawiony na: **${limitNum === 0 ? 'Brak limitu' : `${limitNum} osób`}**`,
-          flags: [MessageFlags.Ephemeral]
-        });
+        await interaction.editReply({
+          content: `✅ Limit osób na kanale został ustawiony na: **${limitNum === 0 ? 'Brak limitu' : `${limitNum} osób`}**`
+        }).catch(() => null);
         return true;
       }
 
       if (actionName === 'status') {
         const newStatus = interaction.fields.getTextInputValue('mv_input_status').trim();
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => null);
+
         await setVoiceChannelStatus(channel, newStatus);
         await refreshPanelMessage(channel, room, ownerMember);
-        await interaction.reply({
-          content: `✅ Status głosowy kanału został zaktualizowany na: **${newStatus || '(wyczyszczony)'}**`,
-          flags: [MessageFlags.Ephemeral]
-        });
+        await interaction.editReply({
+          content: `✅ Status głosowy kanału został zaktualizowany na: **${newStatus || '(wyczyszczony)'}**`
+        }).catch(() => null);
         return true;
       }
     }
@@ -1257,6 +1278,7 @@ async function handleManagedVoiceInteraction(interaction) {
     // --- OBSŁUGA MENU WYBORU (SELECT / USERSELECT) ---
     if (actionType === 'select' || actionType === 'userselect') {
       const targetUserId = interaction.values[0];
+      await interaction.deferUpdate().catch(() => null);
 
       if (actionName === 'invite') {
         room.allowedUserIds.add(targetUserId);
@@ -1264,19 +1286,19 @@ async function handleManagedVoiceInteraction(interaction) {
         await syncRoomPermissions(channel, room);
         await refreshPanelMessage(channel, room, ownerMember);
 
-        await interaction.update({
+        await interaction.editReply({
           content: `✅ Pomyślnie nadano dostęp i widoczność dla użytkownika <@${targetUserId}>! Może teraz bez przeszkód dołączyć do Twojego pokoju.`,
           components: []
-        });
+        }).catch(() => null);
         return true;
       }
 
       if (actionName === 'kick') {
         if (targetUserId === room.ownerId) {
-          await interaction.update({
+          await interaction.editReply({
             content: `❌ Nie możesz wyrzucić samego siebie!`,
             components: []
-          });
+          }).catch(() => null);
           return true;
         }
 
@@ -1291,36 +1313,36 @@ async function handleManagedVoiceInteraction(interaction) {
           await targetMember.voice.disconnect().catch(() => null);
         }
 
-        await interaction.update({
+        await interaction.editReply({
           content: `🚫 Użytkownik <@${targetUserId}> został natychmiast wyrzucony i zablokowany przed wejściem na ten kanał.`,
           components: []
-        });
+        }).catch(() => null);
         return true;
       }
 
       if (actionName === 'transfer') {
         if (targetUserId === room.ownerId) {
-          await interaction.update({
+          await interaction.editReply({
             content: `ℹ️ Ten użytkownik jest już Gospodarzem tego pokoju!`,
             components: []
-          });
+          }).catch(() => null);
           return true;
         }
 
         const targetMember = channel.members.get(targetUserId) || await guild.members.fetch(targetUserId).catch(() => null);
         if (!targetMember) {
-          await interaction.update({
+          await interaction.editReply({
             content: `❌ Nie znaleziono wybranego użytkownika.`,
             components: []
-          });
+          }).catch(() => null);
           return true;
         }
 
         await transferRoomOwnership(channel, targetMember, false);
-        await interaction.update({
+        await interaction.editReply({
           content: `👑 Pomyślnie przekazano rolę Gospodarza użytkownikowi <@${targetUserId}>!`,
           components: []
-        });
+        }).catch(() => null);
         return true;
       }
     }
@@ -1328,12 +1350,10 @@ async function handleManagedVoiceInteraction(interaction) {
     return true;
   } catch (err) {
     console.error('[ManagedVoice] Błąd podczas obsługi interakcji:', err);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: '⏳ Trwa przetwarzanie... Spróbuj ponownie za moment.', flags: [MessageFlags.Ephemeral] }).catch(() => null);
-    }
     return true;
   }
 }
+
 
 // --- REJESTROWANIE CZASU NA KANAŁACH GŁOSOWYCH & OBSŁUGA POKOI PRYWATNYCH ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
