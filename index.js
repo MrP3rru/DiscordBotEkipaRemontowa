@@ -791,10 +791,7 @@ async function claimRoom(channel, member) {
     syncRoomPermissions(channel, room)
   ]);
 
-  // Usunięcie starych wiadomości z czatu przed wysłaniem nowego panelu
-  await cleanChannelChat(channel);
-
-  // Wysłanie nowego panelu na czat głosowy
+  // Wysłanie nowego panelu na czat głosowy (bez usuwania wiadomości przy wejściu)
   try {
     const panelPayload = buildRoomControlPanel(room, member, channel);
     const msg = await channel.send({
@@ -806,8 +803,6 @@ async function claimRoom(channel, member) {
     console.error('[ManagedVoice] Błąd wysyłania panelu na czat:', err.message);
   }
 }
-
-
 
 // Przekazanie własności innemu użytkownikowi (automatyczne lub ręczne)
 async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true) {
@@ -828,21 +823,24 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
     syncRoomPermissions(channel, room)
   ]);
 
-  // Usunięcie starych paneli i wysłanie świeżego
-  await cleanChannelChat(channel);
-
+  // Odświeżenie istniejącego panelu lub wysłanie nowego
   try {
-    const panelPayload = buildRoomControlPanel(room, newOwnerMember, channel);
-    const reasonText = isAutomatic ? '(poprzedni gospodarz opuścił pokój)' : '(własność została przekazana)';
-    const msg = await channel.send({
-      content: `👑 **Nowy Gospodarz:** <@${newOwnerMember.id}> przejął zarządzanie tym pokojem ${reasonText}!`,
-      ...panelPayload
-    });
-    room.panelMessageId = msg.id;
+    if (room.panelMessageId) {
+      await refreshPanelMessage(channel, room, newOwnerMember);
+    } else {
+      const panelPayload = buildRoomControlPanel(room, newOwnerMember, channel);
+      const reasonText = isAutomatic ? '(poprzedni gospodarz opuścił pokój)' : '(własność została przekazana)';
+      const msg = await channel.send({
+        content: `👑 **Nowy Gospodarz:** <@${newOwnerMember.id}> przejął zarządzanie tym pokojem ${reasonText}!`,
+        ...panelPayload
+      });
+      room.panelMessageId = msg.id;
+    }
   } catch (err) {
     console.error('[ManagedVoice] Błąd aktualizacji panelu po zmianie gospodarza:', err.message);
   }
 }
+
 
 // Błyskawiczny reset kanału do stanu wyjściowego (gdy wszyscy opuszczą pokój)
 async function resetManagedRoom(channel) {
