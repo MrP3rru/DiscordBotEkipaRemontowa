@@ -1378,6 +1378,14 @@ async function handleManagedVoiceInteraction(interaction) {
 
 // --- REJESTROWANIE CZASU NA KANAŁACH GŁOSOWYCH & OBSŁUGA POKOI PRYWATNYCH ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
+  // 1. NAJWYŻSZY PRIORYTET: Obsługa prywatnych pokoi głosowych (Claim-to-Own)
+  try {
+    await handleManagedVoiceStateUpdate(oldState, newState);
+  } catch (err) {
+    console.error('[ManagedVoice] Błąd w handleManagedVoiceStateUpdate:', err);
+  }
+
+  // 2. Rejestrowanie czasu spędzonego na kanałach głosowych w bazie danych
   try {
     const member = newState.member || oldState.member;
     if (!member || member.user.bot) return;
@@ -1390,21 +1398,18 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     const switchedChannel = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
 
     if (joinedChannel) {
-      await db.startVoiceSession(userId, guildId, newState.channelId);
+      await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
       console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
     } else if (leftChannel) {
-      await db.endVoiceSession(userId, guildId);
+      await db.endVoiceSession(userId, guildId).catch(() => null);
       console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
     } else if (switchedChannel) {
-      await db.endVoiceSession(userId, guildId);
-      await db.startVoiceSession(userId, guildId, newState.channelId);
+      await db.endVoiceSession(userId, guildId).catch(() => null);
+      await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
       console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
     }
-
-    // Obsługa prywatnych/zarządzanych kanałów głosowych (Claim-to-Own)
-    await handleManagedVoiceStateUpdate(oldState, newState);
   } catch (err) {
-    console.error('Błąd w zdarzeniu voiceStateUpdate:', err.message);
+    console.error('Błąd w rejestracji czasu głosu:', err.message);
   }
 });
 
