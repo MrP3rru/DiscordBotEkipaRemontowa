@@ -469,14 +469,15 @@ client.once(Events.ClientReady, async () => {
 // Pamięć podręczna stanu zarządzanych pokoi głosowych
 const managedRooms = new Map();
 
-// Pobranie listy ID skonfigurowanych kanałów zarządzanych z .env
+// Pobranie listy ID skonfigurowanych kanałów zarządzanych z .env (z wbudowanym ID kanału)
 function getManagedVoiceChannelIds() {
-  const raw = process.env.MANAGED_VOICE_CHANNEL_IDS || '';
+  const raw = process.env.MANAGED_VOICE_CHANNEL_IDS || '1543629049212182588';
   return raw
     .split(',')
     .map(id => id.trim())
     .filter(id => id.length > 0 && id !== 'twoje_id_kanalu');
 }
+
 
 // Pobranie lub utworzenie obiektu stanu dla danego kanału
 function getOrCreateRoom(channel) {
