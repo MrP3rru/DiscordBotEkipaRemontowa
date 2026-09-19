@@ -884,6 +884,83 @@ async function getDeletedMessagesCount() {
   }
 }
 
+/**
+ * Pobiera kolejny trwały numer prywatnego pokoju.
+ */
+async function getNextPrivateRoomNumber() {
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ('private_room_counter', 10)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = GREATEST(system_stats.stat_value + 1, 10)
+         RETURNING stat_value`
+      );
+      return Number(res.rows[0].stat_value);
+    }
+
+    if (dbSQLite) {
+      await dbSQLite.exec('BEGIN IMMEDIATE TRANSACTION');
+      try {
+        await dbSQLite.run(
+          `INSERT INTO system_stats (stat_name, stat_value)
+           VALUES ('private_room_counter', 10)
+           ON CONFLICT (stat_name)
+           DO UPDATE SET stat_value = CASE
+             WHEN stat_value < 9 THEN 10
+             ELSE stat_value + 1
+           END`
+        );
+        const row = await dbSQLite.get(
+          "SELECT stat_value FROM system_stats WHERE stat_name = 'private_room_counter'"
+        );
+        await dbSQLite.exec('COMMIT');
+        return row ? Number(row.stat_value) : null;
+      } catch (error) {
+        await dbSQLite.exec('ROLLBACK').catch(() => null);
+        throw error;
+      }
+    }
+  } catch (error) {
+    console.error('Błąd pobierania numeru prywatnego pokoju:', error.message);
+  }
+
+  return null;
+}
+
+/**
+ * Wyrównuje licznik z numerem znalezionym na istniejącym kanale.
+ */
+async function ensurePrivateRoomCounterAtLeast(number) {
+  if (!Number.isInteger(number) || number < 10) return;
+
+  try {
+    if (isPostgres && pgPool) {
+      await queryPg(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ('private_room_counter', $1)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = GREATEST(system_stats.stat_value, EXCLUDED.stat_value)`,
+        [number]
+      );
+    } else if (dbSQLite) {
+      await dbSQLite.run(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ('private_room_counter', ?)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = CASE
+           WHEN stat_value < excluded.stat_value THEN excluded.stat_value
+           ELSE stat_value
+         END`,
+        [number]
+      );
+    }
+  } catch (error) {
+    console.error('Błąd synchronizacji licznika prywatnych pokoi:', error.message);
+  }
+}
+
 module.exports = {
   initDatabase,
   startVoiceSession,
@@ -897,6 +974,8 @@ module.exports = {
   getActiveSession,
   incrementDeletedMessages,
   getDeletedMessagesCount,
+  getNextPrivateRoomNumber,
+  ensurePrivateRoomCounterAtLeast,
   getWarsawDateString,
   getCurrentWeekRange,
   getCurrentMonthRange

@@ -542,6 +542,30 @@ async function ensureEntryChannel(channel, updateStatus = true) {
   }
 }
 
+function formatPrivateRoomNumber(number) {
+  return String(number).padStart(3, '0');
+}
+
+async function applyPrivateRoomIdentity(channel, member, roomData) {
+  if (!roomData.roomNumber) {
+    roomData.roomNumber = await db.getNextPrivateRoomNumber();
+  }
+
+  if (!roomData.roomNumber) return;
+
+  const formattedNumber = formatPrivateRoomNumber(roomData.roomNumber);
+  const numberLabel = `ID:${formattedNumber}`;
+
+  if (channel.name.startsWith(DYNAMIC_ROOM_NAME_PREFIX)) {
+    const cleanName = channel.name.replace(/\s*•\s*ID:\d+\s*$/, '');
+    if (cleanName !== channel.name) {
+      await channel.edit({ name: cleanName }, 'Usunięcie numeru z nazwy prywatnego pokoju').catch(() => null);
+    }
+  }
+
+  await setVoiceChannelStatus(channel, `🟢 ${numberLabel} • Prywatny pokój`);
+}
+
 function scheduleEntryChannelStatusRestore(channel) {
   if (privateRoomEntryStatusTimer) clearTimeout(privateRoomEntryStatusTimer);
 
@@ -568,9 +592,14 @@ async function registerExistingDynamicRooms(guild) {
 
     let createdForUserId = null;
     let createdByBot = false;
+    const roomNumberMatch = channel.name.match(/ID:(\d+)/);
+    const roomNumber = roomNumberMatch ? Number(roomNumberMatch[1]) : null;
 
     if (channel.name.startsWith(DYNAMIC_ROOM_NAME_PREFIX)) {
-      const displayName = channel.name.slice(DYNAMIC_ROOM_NAME_PREFIX.length).trim();
+      const displayName = channel.name
+        .slice(DYNAMIC_ROOM_NAME_PREFIX.length)
+        .replace(/\s*•\s*ID:\d+\s*$/, '')
+        .trim();
       const matchingMember = guild.members.cache.find(member =>
         member.displayName === displayName || member.user.username === displayName
       );
@@ -583,10 +612,15 @@ async function registerExistingDynamicRooms(guild) {
       createdByBot,
       createdForUserId,
       createdAt: null,
+      roomNumber,
       originalPosition: channel.rawPosition,
       deleteTimer: null,
       restoreTimer: null
     });
+
+    if (roomNumber) {
+      await db.ensurePrivateRoomCounterAtLeast(roomNumber);
+    }
 
     if (!userPrivateRooms.has(createdForUserId)) {
       userPrivateRooms.set(createdForUserId, channel.id);
@@ -631,6 +665,7 @@ async function findExistingPrivateRoomForUser(member) {
       createdByBot: false,
       createdForUserId: member.id,
       createdAt: null,
+      roomNumber: null,
       originalPosition: legacyChannel.rawPosition,
       deleteTimer: null,
       restoreTimer: null
@@ -1116,12 +1151,19 @@ async function createDynamicPrivateRoom(member) {
   const existingChannel = await findExistingPrivateRoomForUser(member);
   if (existingChannel) {
     const roomData = dynamicPrivateRooms.get(existingChannel.id);
+    const room = getOrCreateRoom(existingChannel);
 
     if (roomData?.deleteTimer) {
       clearTimeout(roomData.deleteTimer);
       roomData.deleteTimer = null;
       roomData.deleteAttempts = 0;
     }
+
+    if (!room.ownerId) {
+      await claimRoom(existingChannel, member);
+    }
+
+    await applyPrivateRoomIdentity(existingChannel, member, roomData);
 
     await member.voice.setChannel(existingChannel, 'Powrót do istniejącego prywatnego pokoju');
     addAdminLog(`${member.user.tag} wrócił do istniejącego pokoju #${existingChannel.name}.`);
@@ -1172,6 +1214,7 @@ async function createDynamicPrivateRoom(member) {
       createdByBot: true,
       createdForUserId: member.id,
       createdAt: Date.now(),
+      roomNumber: null,
       originalPosition: channel.rawPosition,
       deleteTimer: null
     });
@@ -1179,6 +1222,7 @@ async function createDynamicPrivateRoom(member) {
 
     getOrCreateRoom(channel);
     await claimRoom(channel, member);
+    await applyPrivateRoomIdentity(channel, member, dynamicPrivateRooms.get(channel.id));
     await member.voice.setChannel(channel, 'Przeniesienie do nowego prywatnego pokoju');
 
     addAdminLog(`Utworzono pokój #${channel.name} (${channel.id}) dla ${member.user.tag}.`);
