@@ -277,6 +277,9 @@ client.once(Events.ClientReady, async () => {
 
       // Inicjalizacja zarządzanych kanałów głosowych (pokoi prywatnych)
       await initManagedVoiceChannels(guild);
+      await registerExistingDynamicRooms(guild);
+      const entryChannel = await guild.channels.fetch(PRIVATE_ROOM_ENTRY_CHANNEL_ID).catch(() => null);
+      await ensureEntryChannel(entryChannel);
     } catch (err) {
       console.error('[Diagnostyka] Błąd pobierania danych o serwerze:', err.message);
     }
@@ -470,21 +473,154 @@ client.once(Events.ClientReady, async () => {
 // Pamięć podręczna stanu zarządzanych pokoi głosowych
 const managedRooms = new Map();
 const dynamicPrivateRooms = new Map();
+const userPrivateRooms = new Map();
 const roomOperationLocks = new Set();
 const roomOperationTimestamps = new Map();
+const adminLogEntries = [];
 
 const PRIVATE_ROOM_ENTRY_CHANNEL_ID = '1543629049212182588';
 const PRIVATE_ROOM_CATEGORY_ID = '1543639402335436890';
+const ADMIN_USER_ID = '248464260991156225';
+const PRIVATE_ROOM_ENTRY_NAME = '🚪・STWÓRZ SWÓJ POKÓJ';
+const PRIVATE_ROOM_ENTRY_STATUS = 'Wejdź, aby utworzyć pokój ✨';
+const DYNAMIC_ROOM_NAME_PREFIX = '🔒 Pokój - ';
+const DYNAMIC_ROOM_TOPIC_PREFIX = 'ekipa-dynamic-room:';
 const PRIVATE_ROOM_DELETE_DELAY_MS = 3 * 60 * 1000;
 const PRIVATE_ROOM_CREATE_COOLDOWN_MS = 2000;
 const PRIVATE_ROOM_DELETE_COOLDOWN_MS = 5000;
 const CHANNEL_RENAME_COOLDOWN_MS = 2 * 60 * 1000;
-const CHANNEL_STATUS_COOLDOWN_MS = 10000;
+const CHANNEL_STATUS_COOLDOWN_MS = 30 * 1000;
+const ROOM_SETTINGS_COOLDOWN_MS = 30 * 1000;
 const PRIVATE_ROOM_DELETE_RETRY_DELAY_MS = 2 * 60 * 1000;
 const PRIVATE_ROOM_DELETE_MAX_ATTEMPTS = 20;
+const DYNAMIC_ROOM_RESTORE_COOLDOWN_MS = 30 * 1000;
+
+function addAdminLog(message) {
+  adminLogEntries.push({ timestamp: Date.now(), message });
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+  while (adminLogEntries.length > 0 && adminLogEntries[0].timestamp < cutoff) {
+    adminLogEntries.shift();
+  }
+}
+
+function getRecentAdminLogs() {
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+  return adminLogEntries
+    .filter(entry => entry.timestamp >= cutoff)
+    .map(entry => `[${new Date(entry.timestamp).toLocaleString('pl-PL')}] ${entry.message}`);
+}
+
+function splitDiscordMessage(text, maxLength = 1900) {
+  const chunks = [];
+  for (let index = 0; index < text.length; index += maxLength) {
+    chunks.push(text.slice(index, index + maxLength));
+  }
+  return chunks.length > 0 ? chunks : ['Brak logów z ostatnich 6 godzin.'];
+}
+
+async function ensureEntryChannel(channel, updateStatus = true) {
+  if (!channel || channel.id !== PRIVATE_ROOM_ENTRY_CHANNEL_ID || !channel.isVoiceBased()) return;
+
+  try {
+    if (channel.name !== PRIVATE_ROOM_ENTRY_NAME) {
+      await channel.edit({ name: PRIVATE_ROOM_ENTRY_NAME }, 'Ustawienie stałej nazwy kanału wejściowego');
+    }
+    if (updateStatus) {
+      await setVoiceChannelStatus(channel, PRIVATE_ROOM_ENTRY_STATUS);
+    }
+  } catch (err) {
+    console.warn(`[DynamicVoice] Nie udało się ustawić wyglądu kanału wejściowego: ${err.message}`);
+  }
+}
 
 function isDynamicPrivateRoom(channel) {
   return Boolean(channel && dynamicPrivateRooms.has(channel.id));
+}
+
+async function registerExistingDynamicRooms(guild) {
+  const channels = await guild.channels.fetch().catch(() => null);
+  if (!channels) return;
+
+  for (const channel of channels.values()) {
+    if (!channel.isVoiceBased() || channel.parentId !== PRIVATE_ROOM_CATEGORY_ID) continue;
+
+    let createdForUserId = null;
+    let createdByBot = false;
+
+    if (typeof channel.topic === 'string' && channel.topic.startsWith(DYNAMIC_ROOM_TOPIC_PREFIX)) {
+      createdForUserId = channel.topic.slice(DYNAMIC_ROOM_TOPIC_PREFIX.length);
+      createdByBot = Boolean(createdForUserId);
+    } else if (channel.name.startsWith(DYNAMIC_ROOM_NAME_PREFIX)) {
+      const displayName = channel.name.slice(DYNAMIC_ROOM_NAME_PREFIX.length).trim();
+      const matchingMember = guild.members.cache.find(member =>
+        member.displayName === displayName || member.user.username === displayName
+      );
+      createdForUserId = matchingMember?.id || null;
+    }
+
+    if (!createdForUserId || dynamicPrivateRooms.has(channel.id)) continue;
+
+    dynamicPrivateRooms.set(channel.id, {
+      createdByBot,
+      createdForUserId,
+      createdAt: null,
+      originalPosition: channel.rawPosition,
+      deleteTimer: null,
+      restoreTimer: null
+    });
+
+    if (!userPrivateRooms.has(createdForUserId)) {
+      userPrivateRooms.set(createdForUserId, channel.id);
+    }
+  }
+}
+
+async function findExistingPrivateRoomForUser(member) {
+  const mappedChannelId = userPrivateRooms.get(member.id);
+  const mappedChannel = mappedChannelId
+    ? await client.channels.fetch(mappedChannelId).catch(() => null)
+    : null;
+
+  if (mappedChannel && isDynamicPrivateRoom(mappedChannel) && mappedChannel.parentId === PRIVATE_ROOM_CATEGORY_ID) {
+    return mappedChannel;
+  }
+
+  if (mappedChannelId) userPrivateRooms.delete(member.id);
+
+  for (const [channelId, roomData] of dynamicPrivateRooms.entries()) {
+    if (roomData.createdForUserId !== member.id) continue;
+
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel && channel.parentId === PRIVATE_ROOM_CATEGORY_ID) {
+      userPrivateRooms.set(member.id, channel.id);
+      return channel;
+    }
+
+    dynamicPrivateRooms.delete(channelId);
+    managedRooms.delete(channelId);
+  }
+
+  const channels = await member.guild.channels.fetch().catch(() => null);
+  const legacyChannel = channels?.find(channel =>
+    channel.isVoiceBased() &&
+    channel.parentId === PRIVATE_ROOM_CATEGORY_ID &&
+    channel.name === `${DYNAMIC_ROOM_NAME_PREFIX}${member.displayName}`.slice(0, 100)
+  );
+
+  if (legacyChannel) {
+    dynamicPrivateRooms.set(legacyChannel.id, {
+      createdByBot: false,
+      createdForUserId: member.id,
+      createdAt: null,
+      originalPosition: legacyChannel.rawPosition,
+      deleteTimer: null,
+      restoreTimer: null
+    });
+    userPrivateRooms.set(member.id, legacyChannel.id);
+    return legacyChannel;
+  }
+
+  return null;
 }
 
 function canRunRoomOperation(operation, key, cooldownMs) {
@@ -546,7 +682,11 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
     try {
       await currentChannel.delete('Automatyczne usunięcie pustego prywatnego pokoju po 3 minutach');
       dynamicPrivateRooms.delete(channel.id);
+      if (userPrivateRooms.get(currentRoomData.createdForUserId) === channel.id) {
+        userPrivateRooms.delete(currentRoomData.createdForUserId);
+      }
       managedRooms.delete(channel.id);
+      addAdminLog(`Usunięto pusty pokój #${currentChannel.name} (${channel.id}).`);
       console.log(`[DynamicVoice] Usunięto pusty kanał #${currentChannel.name} po oczekiwaniu 3 minut.`);
     } catch (err) {
       console.warn(`[DynamicVoice] Nie udało się usunąć kanału ${channel.id}:`, err.message);
@@ -554,7 +694,52 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
     } finally {
       unlockRoomOperation(lockKey);
     }
-  }, PRIVATE_ROOM_DELETE_DELAY_MS);
+  }, delayMs);
+}
+
+function scheduleDynamicPrivateRoomRestore(channelId, delayMs = 2 * 60 * 1000, attempt = 0) {
+  const roomData = dynamicPrivateRooms.get(channelId);
+  if (!roomData || roomData.createdByBot !== true) return;
+
+  if (roomData.restoreTimer) clearTimeout(roomData.restoreTimer);
+  roomData.restoreTimer = setTimeout(async () => {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    const currentRoomData = dynamicPrivateRooms.get(channelId);
+    if (!channel || !currentRoomData || currentRoomData.createdByBot !== true) return;
+    if (channel.parentId === PRIVATE_ROOM_CATEGORY_ID) {
+      currentRoomData.restoreTimer = null;
+      return;
+    }
+    if (attempt >= 10) {
+      addAdminLog(`Nie udało się przywrócić pokoju ${channelId} do kategorii po 10 próbach.`);
+      currentRoomData.restoreTimer = null;
+      return;
+    }
+    if (!canRunRoomOperation('restore', channelId, DYNAMIC_ROOM_RESTORE_COOLDOWN_MS)) {
+      scheduleDynamicPrivateRoomRestore(channelId, delayMs, attempt + 1);
+      return;
+    }
+
+    const lockKey = lockRoomOperation('restore', channelId);
+    if (!lockKey) {
+      scheduleDynamicPrivateRoomRestore(channelId, delayMs, attempt + 1);
+      return;
+    }
+
+    try {
+      await channel.edit({
+        parent: PRIVATE_ROOM_CATEGORY_ID,
+        position: currentRoomData.originalPosition
+      }, 'Ponowienie przywrócenia dynamicznego pokoju do kategorii');
+      currentRoomData.restoreTimer = null;
+      addAdminLog(`Przywrócono pokój #${channel.name} (${channel.id}) do kategorii po ponowieniu próby.`);
+    } catch (err) {
+      scheduleDynamicPrivateRoomRestore(channelId, delayMs, attempt + 1);
+      if (attempt === 9) addAdminLog(`Ostatnia próba przywrócenia pokoju ${channelId} nie powiodła się: ${err.message}`);
+    } finally {
+      unlockRoomOperation(lockKey);
+    }
+  }, delayMs);
 }
 
 // Pobranie listy ID skonfigurowanych kanałów zarządzanych z .env (z wbudowanym ID kanału)
@@ -909,6 +1094,22 @@ async function claimRoom(channel, member) {
 }
 
 async function createDynamicPrivateRoom(member) {
+  const existingChannel = await findExistingPrivateRoomForUser(member);
+  if (existingChannel) {
+    const roomData = dynamicPrivateRooms.get(existingChannel.id);
+
+    if (roomData?.deleteTimer) {
+      clearTimeout(roomData.deleteTimer);
+      roomData.deleteTimer = null;
+      roomData.deleteAttempts = 0;
+    }
+
+    await member.voice.setChannel(existingChannel, 'Powrót do istniejącego prywatnego pokoju');
+    addAdminLog(`${member.user.tag} wrócił do istniejącego pokoju #${existingChannel.name}.`);
+    console.log(`[DynamicVoice] ${member.user.tag} został przeniesiony do istniejącego kanału #${existingChannel.name}.`);
+    return existingChannel;
+  }
+
   const guild = member.guild;
   const category = await guild.channels.fetch(PRIVATE_ROOM_CATEGORY_ID).catch(() => null);
 
@@ -928,9 +1129,10 @@ async function createDynamicPrivateRoom(member) {
   let channel = null;
   try {
     channel = await guild.channels.create({
-      name: `🔒 Pokój - ${member.displayName}`.slice(0, 100),
+      name: `${DYNAMIC_ROOM_NAME_PREFIX}${member.displayName}`.slice(0, 100),
       type: ChannelType.GuildVoice,
       parent: PRIVATE_ROOM_CATEGORY_ID,
+      topic: `${DYNAMIC_ROOM_TOPIC_PREFIX}${member.id}`,
       reason: `Utworzenie prywatnego pokoju dla ${member.user.tag}`
     });
 
@@ -938,19 +1140,23 @@ async function createDynamicPrivateRoom(member) {
       createdByBot: true,
       createdForUserId: member.id,
       createdAt: Date.now(),
+      originalPosition: channel.rawPosition,
       deleteTimer: null
     });
+    userPrivateRooms.set(member.id, channel.id);
 
     getOrCreateRoom(channel);
     await claimRoom(channel, member);
     await member.voice.setChannel(channel, 'Przeniesienie do nowego prywatnego pokoju');
 
+    addAdminLog(`Utworzono pokój #${channel.name} (${channel.id}) dla ${member.user.tag}.`);
     console.log(`[DynamicVoice] Utworzono kanał #${channel.name} dla ${member.user.tag}.`);
     return channel;
   } catch (err) {
     console.error(`[DynamicVoice] Błąd tworzenia pokoju dla ${member.user.tag}:`, err.message);
     if (channel) {
       dynamicPrivateRooms.delete(channel.id);
+      if (userPrivateRooms.get(member.id) === channel.id) userPrivateRooms.delete(member.id);
       managedRooms.delete(channel.id);
       if (channel.parentId === PRIVATE_ROOM_CATEGORY_ID) {
         await channel.delete('Sprzątanie kanału po nieudanym tworzeniu pokoju').catch(() => null);
@@ -1123,6 +1329,11 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
     if (!member || member.user.bot) return;
 
     if (newChannelId === PRIVATE_ROOM_ENTRY_CHANNEL_ID && oldChannelId !== newChannelId) {
+      const entryChannel = newState.channel || await client.channels.fetch(PRIVATE_ROOM_ENTRY_CHANNEL_ID).catch(() => null);
+      if (entryChannel && canRunRoomOperation('entry-appearance', entryChannel.id, 30 * 1000)) {
+        await ensureEntryChannel(entryChannel);
+      }
+      addAdminLog(`${member.user.tag} wszedł na kanał wejściowy.`);
       await createDynamicPrivateRoom(member);
       return;
     }
@@ -1177,6 +1388,9 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
         const remainingMembers = channel.members.filter(m => !m.user.bot && m.id !== member.id);
 
         console.log(`[ManagedVoice] ${member.user.tag} opuścił kanał #${channel.name}. Pozostało osób: ${remainingMembers.size}`);
+        if (isOldDynamic) {
+          addAdminLog(`${member.user.tag} opuścił dynamiczny pokój #${channel.name}. Pozostało osób: ${remainingMembers.size}.`);
+        }
 
         if (isOldDynamic && remainingMembers.size === 0) {
           scheduleDynamicPrivateRoomDeletion(channel);
@@ -1231,6 +1445,23 @@ async function handleManagedVoiceInteraction(interaction) {
     }
 
     const ownerMember = room.ownerId ? (channel.members.get(room.ownerId) || await guild.members.fetch(room.ownerId).catch(() => null)) : null;
+
+    const limitedButtonActions = ['vis', 'lock', 'mute', 'reset'];
+    if (actionType === 'btn' && limitedButtonActions.includes(actionName) && !canRunRoomOperation('settings', channel.id, ROOM_SETTINGS_COOLDOWN_MS)) {
+      await interaction.reply({
+        content: '⏳ Ustawienia tego pokoju można zmieniać maksymalnie raz na 30 sekund.',
+        flags: [MessageFlags.Ephemeral]
+      });
+      return true;
+    }
+
+    if ((actionType === 'select' || actionType === 'userselect') && !canRunRoomOperation('settings', channel.id, ROOM_SETTINGS_COOLDOWN_MS)) {
+      await interaction.reply({
+        content: '⏳ Ustawienia tego pokoju można zmieniać maksymalnie raz na 30 sekund.',
+        flags: [MessageFlags.Ephemeral]
+      });
+      return true;
+    }
 
     // --- OBSŁUGA PRZYCISKÓW ---
     if (actionType === 'btn') {
@@ -1460,7 +1691,7 @@ async function handleManagedVoiceInteraction(interaction) {
           await interaction.editReply({ content: `✅ Nazwa kanału została zmieniona na: **${newName}**` }).catch(() => null);
         } catch (err) {
           await interaction.editReply({
-            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Discord ogranicza zbyt częstą zmianę nazwy kanału (maks. 2 razy na 10 minut).`
+            content: `⚠️ Nie udało się zmienić nazwy (${err.message}). Bot pozwala zmieniać nazwę maksymalnie raz na 2 minuty.`
           }).catch(() => null);
         }
         return true;
@@ -1476,6 +1707,11 @@ async function handleManagedVoiceInteraction(interaction) {
         }
 
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => null);
+
+        if (!canRunRoomOperation('settings', channel.id, ROOM_SETTINGS_COOLDOWN_MS)) {
+          await interaction.editReply({ content: '⏳ Ustawienia tego pokoju można zmieniać maksymalnie raz na 30 sekund.' }).catch(() => null);
+          return true;
+        }
 
         room.userLimit = limitNum;
         try {
@@ -1497,7 +1733,7 @@ async function handleManagedVoiceInteraction(interaction) {
 
         if (!canRunRoomOperation('status', channel.id, CHANNEL_STATUS_COOLDOWN_MS)) {
           await interaction.reply({
-            content: '⏳ Status kanału można zmieniać co najwyżej raz na 10 sekund. Spróbuj później.',
+            content: '⏳ Status kanału można zmieniać co najwyżej raz na 30 sekund. Spróbuj później.',
             flags: [MessageFlags.Ephemeral]
           });
           return true;
@@ -1631,10 +1867,65 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
+client.on('channelUpdate', async (oldChannel, newChannel) => {
+  try {
+    if (newChannel.id === PRIVATE_ROOM_ENTRY_CHANNEL_ID) {
+      await ensureEntryChannel(newChannel, false);
+      return;
+    }
+
+    const roomData = dynamicPrivateRooms.get(newChannel.id);
+    if (!roomData || roomData.createdByBot !== true) return;
+    if (newChannel.parentId === PRIVATE_ROOM_CATEGORY_ID) return;
+    if (!canRunRoomOperation('restore', newChannel.id, DYNAMIC_ROOM_RESTORE_COOLDOWN_MS)) {
+      scheduleDynamicPrivateRoomRestore(newChannel.id);
+      return;
+    }
+
+    try {
+      await newChannel.edit({
+        parent: PRIVATE_ROOM_CATEGORY_ID,
+        position: roomData.originalPosition
+      }, 'Przywrócenie dynamicznego pokoju do bezpiecznej kategorii');
+      addAdminLog(`Przywrócono pokój #${newChannel.name} (${newChannel.id}) do kategorii po ręcznym przeniesieniu.`);
+    } catch (err) {
+      scheduleDynamicPrivateRoomRestore(newChannel.id);
+      throw err;
+    }
+  } catch (err) {
+    addAdminLog(`Nie udało się przywrócić przeniesionego pokoju (${newChannel?.id || 'brak ID'}): ${err.message}`);
+    console.warn('[DynamicVoice] Nie udało się przywrócić kategorii pokoju:', err.message);
+  }
+});
+
+client.on('channelDelete', (channel) => {
+  const roomData = dynamicPrivateRooms.get(channel.id);
+  if (!roomData) return;
+
+  dynamicPrivateRooms.delete(channel.id);
+  if (userPrivateRooms.get(roomData.createdForUserId) === channel.id) {
+    userPrivateRooms.delete(roomData.createdForUserId);
+  }
+  managedRooms.delete(channel.id);
+  addAdminLog(`Kanał dynamicznego pokoju #${channel.name} (${channel.id}) został usunięty ręcznie lub przez Discorda.`);
+});
+
 // Automatyczne usuwanie wiadomości tekstowych użytkowników na czacie kanału zarządzanego (czat tylko dla panelu)
 client.on('messageCreate', async (message) => {
   try {
     if (message.author.bot) return;
+
+    if (message.channel?.isDMBased()) {
+      if (message.author.id !== ADMIN_USER_ID || message.content.trim().toLowerCase() !== 'adminlog') return;
+
+      const logs = getRecentAdminLogs();
+      const header = '📋 Logi bota z ostatnich 6 godzin:\n';
+      for (const chunk of splitDiscordMessage(logs.join('\n'), 1800)) {
+        await message.author.send(`${header}${chunk}`);
+      }
+      return;
+    }
+
     const managedIds = getManagedVoiceChannelIds();
     if (managedIds.includes(message.channelId) || dynamicPrivateRooms.has(message.channelId)) {
       await message.delete().catch(() => null);
