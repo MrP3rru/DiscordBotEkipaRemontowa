@@ -1044,7 +1044,8 @@ async function syncRoomPermissions(channel, room) {
     const everyoneAllow = [];
     const everyoneDeny = [
       PermissionFlagsBits.ReadMessageHistory,
-      PermissionFlagsBits.SendMessages
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.MoveMembers
     ];
 
     if (room.isPrivate) {
@@ -1098,7 +1099,8 @@ async function syncRoomPermissions(channel, room) {
       ];
       const denyPerms = [
         PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.SendMessages
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.MoveMembers
       ];
 
       if (room.isMutedGuests) {
