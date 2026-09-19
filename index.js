@@ -132,9 +132,9 @@ async function updatePresence() {
       return;
     }
 
-    const deletedCount = await db.getDeletedMessagesCount();
-    const formattedDeleted = formatNumberShort(deletedCount);
-    const statusText = `🗑️ Usunięto: ${formattedDeleted}`;
+    const actionsCount = await db.getBotActionsCount();
+    const formattedActions = formatNumberShort(actionsCount);
+    const statusText = `✅ Wykonano: ${formattedActions}`;
 
     client.user.setPresence({
       activities: [{ 
@@ -761,6 +761,7 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
 
     try {
       await currentChannel.delete('Automatyczne usunięcie pustego prywatnego pokoju po 3 minutach');
+      await db.incrementBotActions();
       dynamicPrivateRooms.delete(channel.id);
       if (userPrivateRooms.get(currentRoomData.createdForUserId) === channel.id) {
         userPrivateRooms.delete(currentRoomData.createdForUserId);
@@ -888,11 +889,13 @@ async function setVoiceChannelStatus(channel, statusText) {
       : null;
 
     if (typeof channel.setStatus === 'function') {
-      await channel.setStatus(statusPayload).catch(() => null);
+      const result = await channel.setStatus(statusPayload).catch(() => null);
+      if (result) await db.incrementBotActions();
     } else if (client.rest) {
-      await client.rest.put(`/channels/${channel.id}/voice-status`, {
+      const result = await client.rest.put(`/channels/${channel.id}/voice-status`, {
         body: { status: statusPayload }
       }).catch(() => null);
+      if (result) await db.incrementBotActions();
     }
   } catch (err) {
     // Ciche ignorowanie
@@ -1168,6 +1171,7 @@ async function claimRoom(channel, member) {
       content: `👋 Witaj <@${member.id}>! Oto Twój prywatny panel kontrolny pokoju:`,
       ...panelPayload
     });
+    await db.incrementBotActions();
     room.panelMessageId = msg.id;
     console.log(`[ManagedVoice] ✅ Panel wysłany dla ${member.user.tag}, ID: ${msg.id}`);
   } catch (err) {
@@ -1194,6 +1198,7 @@ async function createDynamicPrivateRoom(member) {
     await applyPrivateRoomIdentity(existingChannel, member, roomData);
 
     await member.voice.setChannel(existingChannel, 'Powrót do istniejącego prywatnego pokoju');
+    await db.incrementBotActions();
     addAdminLog(`${member.user.tag} wrócił do istniejącego pokoju #${existingChannel.name}.`);
     console.log(`[DynamicVoice] ${member.user.tag} został przeniesiony do istniejącego kanału #${existingChannel.name}.`);
     return existingChannel;
@@ -1237,6 +1242,7 @@ async function createDynamicPrivateRoom(member) {
       parent: PRIVATE_ROOM_CATEGORY_ID,
       reason: `Utworzenie prywatnego pokoju dla ${member.user.tag}`
     });
+    await db.incrementBotActions();
 
     dynamicPrivateRooms.set(channel.id, {
       createdByBot: true,
@@ -1252,6 +1258,7 @@ async function createDynamicPrivateRoom(member) {
     await claimRoom(channel, member);
     await applyPrivateRoomIdentity(channel, member, dynamicPrivateRooms.get(channel.id));
     await member.voice.setChannel(channel, 'Przeniesienie do nowego prywatnego pokoju');
+    await db.incrementBotActions();
 
     addAdminLog(`Utworzono pokój #${channel.name} (${channel.id}) dla ${member.user.tag}.`);
     console.log(`[DynamicVoice] Utworzono kanał #${channel.name} dla ${member.user.tag}.`);
@@ -1264,7 +1271,8 @@ async function createDynamicPrivateRoom(member) {
       if (userPrivateRooms.get(member.id) === channel.id) userPrivateRooms.delete(member.id);
       managedRooms.delete(channel.id);
       if (channel.parentId === PRIVATE_ROOM_CATEGORY_ID) {
-        await channel.delete('Sprzątanie kanału po nieudanym tworzeniu pokoju').catch(() => null);
+        const deletedChannel = await channel.delete('Sprzątanie kanału po nieudanym tworzeniu pokoju').catch(() => null);
+        if (deletedChannel) await db.incrementBotActions();
       }
     }
     return null;
@@ -1305,6 +1313,7 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
         content: `👑 **Nowy Gospodarz:** <@${newOwnerMember.id}> przejął zarządzanie tym pokojem ${reasonText}!`,
         ...panelPayload
       });
+      await db.incrementBotActions();
       room.panelMessageId = msg.id;
     }
   } catch (err) {

@@ -186,6 +186,12 @@ async function initDatabase() {
         stat_value INTEGER DEFAULT 0
       )
     `);
+
+    await dbSQLite.run(
+      `INSERT INTO system_stats (stat_name, stat_value)
+       SELECT 'bot_actions', COALESCE((SELECT stat_value FROM system_stats WHERE stat_name = 'deleted_messages'), 0)
+       WHERE NOT EXISTS (SELECT 1 FROM system_stats WHERE stat_name = 'bot_actions')`
+    );
   } catch (error) {
     console.error('❌ Błąd inicjalizacji zapasowej bazy SQLite:', error);
   }
@@ -249,6 +255,12 @@ async function initDatabase() {
           stat_value BIGINT DEFAULT 0
         )
       `);
+
+        await queryPg(
+          `INSERT INTO system_stats (stat_name, stat_value)
+           SELECT 'bot_actions', COALESCE((SELECT stat_value FROM system_stats WHERE stat_name = 'deleted_messages'), 0)
+           WHERE NOT EXISTS (SELECT 1 FROM system_stats WHERE stat_name = 'bot_actions')`
+        );
 
       // Zabezpieczenie Supabase (Row Level Security - RLS)
       // Blokuje nieautoryzowany dostęp przez publiczne API REST Supabase,
@@ -856,9 +868,58 @@ async function incrementDeletedMessages(count) {
         [count, count]
       );
     }
+    await incrementBotActions(count);
   } catch (error) {
     console.error('Błąd podczas inkrementacji usuniętych wiadomości:', error.message);
   }
+}
+
+/**
+ * Zwiększa łączny licznik udanych akcji wykonanych przez bota.
+ */
+async function incrementBotActions(count = 1) {
+  if (!Number.isFinite(count) || count <= 0) return;
+
+  try {
+    if (isPostgres && pgPool) {
+      await queryPg(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ('bot_actions', $1)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = system_stats.stat_value + EXCLUDED.stat_value`,
+        [count]
+      );
+    } else if (dbSQLite) {
+      await dbSQLite.run(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ('bot_actions', ?)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = stat_value + ?`,
+        [count, count]
+      );
+    }
+  } catch (error) {
+    console.error('Błąd zwiększania licznika akcji bota:', error.message);
+  }
+}
+
+/**
+ * Pobiera łączną liczbę udanych akcji wykonanych przez bota.
+ */
+async function getBotActionsCount() {
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg("SELECT stat_value FROM system_stats WHERE stat_name = 'bot_actions'");
+      return res.rows.length > 0 ? Number(res.rows[0].stat_value) : 0;
+    }
+    if (dbSQLite) {
+      const row = await dbSQLite.get("SELECT stat_value FROM system_stats WHERE stat_name = 'bot_actions'");
+      return row ? Number(row.stat_value) : 0;
+    }
+  } catch (error) {
+    console.error('Błąd pobierania licznika akcji bota:', error.message);
+  }
+  return 0;
 }
 
 /**
@@ -974,6 +1035,8 @@ module.exports = {
   getActiveSession,
   incrementDeletedMessages,
   getDeletedMessagesCount,
+  incrementBotActions,
+  getBotActionsCount,
   getNextPrivateRoomNumber,
   ensurePrivateRoomCounterAtLeast,
   getWarsawDateString,
