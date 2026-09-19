@@ -546,6 +546,22 @@ function formatPrivateRoomNumber(number) {
   return String(number).padStart(3, '0');
 }
 
+function formatWarsawTime(timestamp) {
+  return new Intl.DateTimeFormat('pl-PL', {
+    timeZone: 'Europe/Warsaw',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).format(new Date(timestamp));
+}
+
+function getActivePrivateRoomStatus(roomData) {
+  return roomData?.roomNumber
+    ? `🟢 ID:${formatPrivateRoomNumber(roomData.roomNumber)} • Prywatny pokój`
+    : '🟢 Prywatny pokój';
+}
+
 async function applyPrivateRoomIdentity(channel, member, roomData) {
   if (!roomData.roomNumber) {
     roomData.roomNumber = await db.getNextPrivateRoomNumber();
@@ -703,8 +719,18 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
   const roomData = dynamicPrivateRooms.get(channel.id);
   if (!roomData) return;
 
+  const hadDeleteTimer = Boolean(roomData.deleteTimer);
   if (roomData.deleteTimer) clearTimeout(roomData.deleteTimer);
   roomData.deleteAttempts = attempt;
+  roomData.deleteScheduledAt = Date.now() + delayMs;
+
+  if (!hadDeleteTimer) {
+    setVoiceChannelStatus(
+      channel,
+      `🟡 Pusty • zostanie usunięty o ${formatWarsawTime(roomData.deleteScheduledAt)}`
+    );
+  }
+
   roomData.deleteTimer = setTimeout(async () => {
     const currentChannel = await client.channels.fetch(channel.id).catch(() => null);
     const currentRoomData = dynamicPrivateRooms.get(channel.id);
@@ -1480,8 +1506,12 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
         if (isOldDynamic && remainingMembers.size === 0) {
           scheduleDynamicPrivateRoomDeletion(channel);
+            roomData.deleteScheduledAt = null;
         } else if (remainingMembers.size === 0) {
-          await resetManagedRoom(channel);
+          if (roomData) {
+            roomData.deleteAttempts = 0;
+            await setVoiceChannelStatus(channel, getActivePrivateRoomStatus(roomData));
+          }
         } else if (room.ownerId === member.id) {
           const candidates = Array.from(remainingMembers.values());
           const randomNewOwner = candidates[Math.floor(Math.random() * candidates.length)];
