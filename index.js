@@ -482,9 +482,9 @@ const PRIVATE_ROOM_ENTRY_CHANNEL_ID = '1543629049212182588';
 const PRIVATE_ROOM_CATEGORY_ID = '1543639402335436890';
 const ADMIN_USER_ID = '248464260991156225';
 const PRIVATE_ROOM_ENTRY_NAME = '🚪・STWÓRZ SWÓJ POKÓJ';
-const PRIVATE_ROOM_ENTRY_STATUS = 'Wejdź, aby utworzyć pokój ✨';
+const PRIVATE_ROOM_ENTRY_STATUS = '🟢 Wejdź, aby utworzyć prywatny kanał';
+const PRIVATE_ROOM_ENTRY_STATUS_DELAY_MS = 60 * 1000;
 const DYNAMIC_ROOM_NAME_PREFIX = '🔒 Pokój - ';
-const DYNAMIC_ROOM_TOPIC_PREFIX = 'ekipa-dynamic-room:';
 const PRIVATE_ROOM_DELETE_DELAY_MS = 3 * 60 * 1000;
 const PRIVATE_ROOM_CREATE_COOLDOWN_MS = 2000;
 const PRIVATE_ROOM_DELETE_COOLDOWN_MS = 5000;
@@ -494,6 +494,7 @@ const ROOM_SETTINGS_COOLDOWN_MS = 30 * 1000;
 const PRIVATE_ROOM_DELETE_RETRY_DELAY_MS = 2 * 60 * 1000;
 const PRIVATE_ROOM_DELETE_MAX_ATTEMPTS = 20;
 const DYNAMIC_ROOM_RESTORE_COOLDOWN_MS = 30 * 1000;
+let privateRoomEntryStatusTimer = null;
 
 function addAdminLog(message) {
   adminLogEntries.push({ timestamp: Date.now(), message });
@@ -518,6 +519,14 @@ function splitDiscordMessage(text, maxLength = 1900) {
   return chunks.length > 0 ? chunks : ['Brak logów z ostatnich 6 godzin.'];
 }
 
+async function sendAdminLogs(target) {
+  const logs = getRecentAdminLogs();
+  const header = '📋 Logi bota z ostatnich 6 godzin:\n';
+  for (const chunk of splitDiscordMessage(logs.join('\n'), 1800)) {
+    await target.send(`${header}${chunk}`);
+  }
+}
+
 async function ensureEntryChannel(channel, updateStatus = true) {
   if (!channel || channel.id !== PRIVATE_ROOM_ENTRY_CHANNEL_ID || !channel.isVoiceBased()) return;
 
@@ -531,6 +540,19 @@ async function ensureEntryChannel(channel, updateStatus = true) {
   } catch (err) {
     console.warn(`[DynamicVoice] Nie udało się ustawić wyglądu kanału wejściowego: ${err.message}`);
   }
+}
+
+function scheduleEntryChannelStatusRestore(channel) {
+  if (privateRoomEntryStatusTimer) clearTimeout(privateRoomEntryStatusTimer);
+
+  privateRoomEntryStatusTimer = setTimeout(async () => {
+    privateRoomEntryStatusTimer = null;
+    const currentChannel = await client.channels.fetch(PRIVATE_ROOM_ENTRY_CHANNEL_ID).catch(() => null);
+    if (!currentChannel || currentChannel.id !== channel.id || currentChannel.members.some(member => !member.user.bot)) return;
+
+    await ensureEntryChannel(currentChannel, true);
+    addAdminLog('Przywrócono status pustego kanału wejściowego po 1 minucie.');
+  }, PRIVATE_ROOM_ENTRY_STATUS_DELAY_MS);
 }
 
 function isDynamicPrivateRoom(channel) {
@@ -547,10 +569,7 @@ async function registerExistingDynamicRooms(guild) {
     let createdForUserId = null;
     let createdByBot = false;
 
-    if (typeof channel.topic === 'string' && channel.topic.startsWith(DYNAMIC_ROOM_TOPIC_PREFIX)) {
-      createdForUserId = channel.topic.slice(DYNAMIC_ROOM_TOPIC_PREFIX.length);
-      createdByBot = Boolean(createdForUserId);
-    } else if (channel.name.startsWith(DYNAMIC_ROOM_NAME_PREFIX)) {
+    if (channel.name.startsWith(DYNAMIC_ROOM_NAME_PREFIX)) {
       const displayName = channel.name.slice(DYNAMIC_ROOM_NAME_PREFIX.length).trim();
       const matchingMember = guild.members.cache.find(member =>
         member.displayName === displayName || member.user.username === displayName
@@ -1118,6 +1137,20 @@ async function createDynamicPrivateRoom(member) {
     return null;
   }
 
+  const botMember = guild.members.me || await guild.members.fetch(client.user.id).catch(() => null);
+  const categoryPermissions = botMember ? category.permissionsFor(botMember) : null;
+  const missingPermissions = [
+    [PermissionFlagsBits.ManageChannels, 'Manage Channels'],
+    [PermissionFlagsBits.MoveMembers, 'Move Members']
+  ].filter(([permission]) => !categoryPermissions?.has(permission));
+
+  if (missingPermissions.length > 0) {
+    const missingNames = missingPermissions.map(([, name]) => name).join(', ');
+    addAdminLog(`Nie można utworzyć pokoju dla ${member.user.tag}. Brak uprawnień: ${missingNames}.`);
+    console.warn(`[DynamicVoice] Brak uprawnień do obsługi pokoju: ${missingNames}.`);
+    return null;
+  }
+
   if (!canRunRoomOperation('create', member.id, PRIVATE_ROOM_CREATE_COOLDOWN_MS)) {
     console.warn(`[DynamicVoice] Pominięto zbyt szybkie tworzenie pokoju dla ${member.user.tag}.`);
     return null;
@@ -1132,7 +1165,6 @@ async function createDynamicPrivateRoom(member) {
       name: `${DYNAMIC_ROOM_NAME_PREFIX}${member.displayName}`.slice(0, 100),
       type: ChannelType.GuildVoice,
       parent: PRIVATE_ROOM_CATEGORY_ID,
-      topic: `${DYNAMIC_ROOM_TOPIC_PREFIX}${member.id}`,
       reason: `Utworzenie prywatnego pokoju dla ${member.user.tag}`
     });
 
@@ -1153,6 +1185,7 @@ async function createDynamicPrivateRoom(member) {
     console.log(`[DynamicVoice] Utworzono kanał #${channel.name} dla ${member.user.tag}.`);
     return channel;
   } catch (err) {
+    addAdminLog(`Nie udało się utworzyć pokoju dla ${member.user.tag}: ${err.message}`);
     console.error(`[DynamicVoice] Błąd tworzenia pokoju dla ${member.user.tag}:`, err.message);
     if (channel) {
       dynamicPrivateRooms.delete(channel.id);
@@ -1328,7 +1361,16 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
     const member = newState.member || oldState.member;
     if (!member || member.user.bot) return;
 
+    if (oldChannelId === PRIVATE_ROOM_ENTRY_CHANNEL_ID && oldChannelId !== newChannelId) {
+      const entryChannel = oldState.channel || await client.channels.fetch(PRIVATE_ROOM_ENTRY_CHANNEL_ID).catch(() => null);
+      if (entryChannel) scheduleEntryChannelStatusRestore(entryChannel);
+    }
+
     if (newChannelId === PRIVATE_ROOM_ENTRY_CHANNEL_ID && oldChannelId !== newChannelId) {
+      if (privateRoomEntryStatusTimer) {
+        clearTimeout(privateRoomEntryStatusTimer);
+        privateRoomEntryStatusTimer = null;
+      }
       const entryChannel = newState.channel || await client.channels.fetch(PRIVATE_ROOM_ENTRY_CHANNEL_ID).catch(() => null);
       if (entryChannel && canRunRoomOperation('entry-appearance', entryChannel.id, 30 * 1000)) {
         await ensureEntryChannel(entryChannel);
@@ -1918,11 +1960,13 @@ client.on('messageCreate', async (message) => {
     if (message.channel?.isDMBased()) {
       if (message.author.id !== ADMIN_USER_ID || message.content.trim().toLowerCase() !== 'adminlog') return;
 
-      const logs = getRecentAdminLogs();
-      const header = '📋 Logi bota z ostatnich 6 godzin:\n';
-      for (const chunk of splitDiscordMessage(logs.join('\n'), 1800)) {
-        await message.author.send(`${header}${chunk}`);
-      }
+      await sendAdminLogs(message.author);
+      return;
+    }
+
+    if (message.author.id === ADMIN_USER_ID && message.content.trim().toLowerCase() === '!adminlog') {
+      await message.delete().catch(() => null);
+      await sendAdminLogs(message.channel);
       return;
     }
 
