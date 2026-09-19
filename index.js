@@ -33,6 +33,7 @@ process.on('uncaughtException', (error) => {
 // --- GLOBALNE ZMIENNE STANU BOTA ---
 const activeClearChannels = new Set();
 let isAutoCleanEnabled = true;
+let presenceRotationIndex = 0;
 
 // --- SERWER EXPRESS (Utrzymanie aktywności na Render) ---
 const app = express();
@@ -132,9 +133,21 @@ async function updatePresence() {
       return;
     }
 
-    const actionsCount = await db.getBotActionsCount();
-    const formattedActions = formatNumberShort(actionsCount);
-    const statusText = `✅ Wykonano: ${formattedActions}`;
+    const [actionsCount, deletedCount, sentCount, settingsChangesCount] = await Promise.all([
+      db.getBotActionsCount(),
+      db.getDeletedMessagesCount(),
+      db.getBotStat('sent_messages'),
+      db.getBotStat('settings_changes')
+    ]);
+
+    const statusMessages = [
+      `✅ Wykonano: ${formatNumberShort(actionsCount)}`,
+      `🗑️ Usunięto: ${formatNumberShort(deletedCount)}`,
+      `📨 Wysłano: ${formatNumberShort(sentCount)}`,
+      `🎛️ Zmieniono ustawień: ${formatNumberShort(settingsChangesCount)}`
+    ];
+    const statusText = statusMessages[presenceRotationIndex % statusMessages.length];
+    presenceRotationIndex += 1;
 
     client.user.setPresence({
       activities: [{ 
@@ -458,7 +471,7 @@ client.once(Events.ClientReady, async () => {
   // Uruchomienie pętli aktualizujących
   updatePresence();
   updateApplicationBio();
-  setInterval(updatePresence, 30000); // co 30 sekund
+  setInterval(updatePresence, 300000); // rotacja statusu co 5 minut
   setInterval(updateApplicationBio, 300000); // co 5 minut (bezpiecznie przed rate limitem)
   setInterval(db.checkpointActiveSessions, 300000); // co 5 minut zapisywanie sesji w tle
 
@@ -762,6 +775,7 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
     try {
       await currentChannel.delete('Automatyczne usunięcie pustego prywatnego pokoju po 3 minutach');
       await db.incrementBotActions();
+      await db.incrementBotStat('deleted_channels');
       dynamicPrivateRooms.delete(channel.id);
       if (userPrivateRooms.get(currentRoomData.createdForUserId) === channel.id) {
         userPrivateRooms.delete(currentRoomData.createdForUserId);
@@ -1172,6 +1186,7 @@ async function claimRoom(channel, member) {
       ...panelPayload
     });
     await db.incrementBotActions();
+    await db.incrementBotStat('sent_messages');
     room.panelMessageId = msg.id;
     console.log(`[ManagedVoice] ✅ Panel wysłany dla ${member.user.tag}, ID: ${msg.id}`);
   } catch (err) {
@@ -1199,6 +1214,7 @@ async function createDynamicPrivateRoom(member) {
 
     await member.voice.setChannel(existingChannel, 'Powrót do istniejącego prywatnego pokoju');
     await db.incrementBotActions();
+    await db.incrementBotStat('moved_members');
     addAdminLog(`${member.user.tag} wrócił do istniejącego pokoju #${existingChannel.name}.`);
     console.log(`[DynamicVoice] ${member.user.tag} został przeniesiony do istniejącego kanału #${existingChannel.name}.`);
     return existingChannel;
@@ -1243,6 +1259,7 @@ async function createDynamicPrivateRoom(member) {
       reason: `Utworzenie prywatnego pokoju dla ${member.user.tag}`
     });
     await db.incrementBotActions();
+    await db.incrementBotStat('created_channels');
 
     dynamicPrivateRooms.set(channel.id, {
       createdByBot: true,
@@ -1259,6 +1276,7 @@ async function createDynamicPrivateRoom(member) {
     await applyPrivateRoomIdentity(channel, member, dynamicPrivateRooms.get(channel.id));
     await member.voice.setChannel(channel, 'Przeniesienie do nowego prywatnego pokoju');
     await db.incrementBotActions();
+    await db.incrementBotStat('moved_members');
 
     addAdminLog(`Utworzono pokój #${channel.name} (${channel.id}) dla ${member.user.tag}.`);
     console.log(`[DynamicVoice] Utworzono kanał #${channel.name} dla ${member.user.tag}.`);
@@ -1314,6 +1332,7 @@ async function transferRoomOwnership(channel, newOwnerMember, isAutomatic = true
         ...panelPayload
       });
       await db.incrementBotActions();
+      await db.incrementBotStat('sent_messages');
       room.panelMessageId = msg.id;
     }
   } catch (err) {
@@ -1590,6 +1609,10 @@ async function handleManagedVoiceInteraction(interaction) {
       return true;
     }
 
+    if (actionType === 'btn' && limitedButtonActions.includes(actionName)) {
+      await db.incrementBotStat('settings_changes');
+    }
+
     // --- OBSŁUGA PRZYCISKÓW ---
     if (actionType === 'btn') {
       if (actionName === 'vis') {
@@ -1795,6 +1818,10 @@ async function handleManagedVoiceInteraction(interaction) {
 
     // --- OBSŁUGA MODALI ---
     if (actionType === 'modal') {
+      if (['rename', 'limit', 'status'].includes(actionName)) {
+        await db.incrementBotStat('settings_changes');
+      }
+
       if (actionName === 'rename') {
         const newName = interaction.fields.getTextInputValue('mv_input_name').trim();
         if (!newName) {
@@ -1881,6 +1908,7 @@ async function handleManagedVoiceInteraction(interaction) {
     if (actionType === 'select' || actionType === 'userselect') {
       const targetUserId = interaction.values[0];
       await interaction.deferUpdate().catch(() => null);
+      await db.incrementBotStat('settings_changes');
 
       if (actionName === 'invite') {
         room.allowedUserIds.add(targetUserId);

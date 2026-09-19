@@ -904,6 +904,54 @@ async function incrementBotActions(count = 1) {
 }
 
 /**
+ * Zwiększa wybrany licznik statystyk bota.
+ */
+async function incrementBotStat(statName, count = 1) {
+  if (!statName || !Number.isFinite(count) || count <= 0) return;
+
+  try {
+    if (isPostgres && pgPool) {
+      await queryPg(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES ($1, $2)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = system_stats.stat_value + EXCLUDED.stat_value`,
+        [statName, count]
+      );
+    } else if (dbSQLite) {
+      await dbSQLite.run(
+        `INSERT INTO system_stats (stat_name, stat_value)
+         VALUES (?, ?)
+         ON CONFLICT (stat_name)
+         DO UPDATE SET stat_value = stat_value + ?`,
+        [statName, count, count]
+      );
+    }
+  } catch (error) {
+    console.error(`Błąd zwiększania statystyki ${statName}:`, error.message);
+  }
+}
+
+/**
+ * Pobiera wybrany licznik statystyk bota.
+ */
+async function getBotStat(statName) {
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg('SELECT stat_value FROM system_stats WHERE stat_name = $1', [statName]);
+      return res.rows.length > 0 ? Number(res.rows[0].stat_value) : 0;
+    }
+    if (dbSQLite) {
+      const row = await dbSQLite.get('SELECT stat_value FROM system_stats WHERE stat_name = ?', [statName]);
+      return row ? Number(row.stat_value) : 0;
+    }
+  } catch (error) {
+    console.error(`Błąd pobierania statystyki ${statName}:`, error.message);
+  }
+  return 0;
+}
+
+/**
  * Pobiera łączną liczbę udanych akcji wykonanych przez bota.
  */
 async function getBotActionsCount() {
@@ -1037,6 +1085,8 @@ module.exports = {
   getDeletedMessagesCount,
   incrementBotActions,
   getBotActionsCount,
+  incrementBotStat,
+  getBotStat,
   getNextPrivateRoomNumber,
   ensurePrivateRoomCounterAtLeast,
   getWarsawDateString,
