@@ -277,7 +277,7 @@ client.once(Events.ClientReady, async () => {
       console.log(`[Diagnostyka] Połączono z serwerem: ${guild.name}`);
       
       const channels = await guild.channels.fetch();
-      const voiceChannels = channels.filter(c => c.isVoiceBased());
+      const voiceChannels = channels.filter(c => c && typeof c.isVoiceBased === 'function' && c.isVoiceBased());
       console.log(`[Diagnostyka] Widoczne kanały głosowe (${voiceChannels.size}): ${voiceChannels.map(c => `#${c.name}`).join(', ') || 'Brak'}`);
       
       const hasCleanChannel = channels.has(cleanChannelId);
@@ -541,7 +541,7 @@ async function sendAdminLogs(target) {
 }
 
 async function ensureEntryChannel(channel, updateStatus = true) {
-  if (!channel || channel.id !== PRIVATE_ROOM_ENTRY_CHANNEL_ID || !channel.isVoiceBased()) return;
+  if (!channel || channel.id !== PRIVATE_ROOM_ENTRY_CHANNEL_ID || typeof channel.isVoiceBased !== 'function' || !channel.isVoiceBased()) return;
 
   try {
     if (channel.name !== PRIVATE_ROOM_ENTRY_NAME) {
@@ -608,8 +608,10 @@ function scheduleEntryChannelStatusRestore(channel) {
   }, PRIVATE_ROOM_ENTRY_STATUS_DELAY_MS);
 }
 
-function isDynamicPrivateRoom(channel) {
-  return Boolean(channel && dynamicPrivateRooms.has(channel.id));
+function isDynamicPrivateRoom(channelOrId) {
+  if (!channelOrId) return false;
+  const id = typeof channelOrId === 'string' ? channelOrId : channelOrId.id;
+  return Boolean(id && dynamicPrivateRooms.has(id));
 }
 
 async function registerExistingDynamicRooms(guild) {
@@ -617,7 +619,7 @@ async function registerExistingDynamicRooms(guild) {
   if (!channels) return;
 
   for (const channel of channels.values()) {
-    if (!channel.isVoiceBased() || channel.parentId !== PRIVATE_ROOM_CATEGORY_ID) continue;
+    if (!channel || typeof channel.isVoiceBased !== 'function' || !channel.isVoiceBased() || channel.parentId !== PRIVATE_ROOM_CATEGORY_ID) continue;
 
     let createdForUserId = null;
     let createdByBot = false;
@@ -684,6 +686,8 @@ async function findExistingPrivateRoomForUser(member) {
 
   const channels = await member.guild.channels.fetch().catch(() => null);
   const legacyChannel = channels?.find(channel =>
+    channel &&
+    typeof channel.isVoiceBased === 'function' &&
     channel.isVoiceBased() &&
     channel.parentId === PRIVATE_ROOM_CATEGORY_ID &&
     channel.name === `${DYNAMIC_ROOM_NAME_PREFIX}${member.displayName}`.slice(0, 100)
@@ -1423,7 +1427,7 @@ async function initManagedVoiceChannels(guild) {
   for (const chanId of managedIds) {
     try {
       const channel = await guild.channels.fetch(chanId).catch(() => null);
-      if (channel && channel.isVoiceBased()) {
+      if (channel && typeof channel.isVoiceBased === 'function' && channel.isVoiceBased()) {
         const room = getOrCreateRoom(channel);
         const nonBots = channel.members.filter(m => !m.user.bot);
         if (nonBots.size === 0) {
@@ -1455,8 +1459,8 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
     const isOldManaged = oldChannelId && managedIds.includes(oldChannelId);
     const isNewManaged = newChannelId && managedIds.includes(newChannelId);
-    const isOldDynamic = oldChannelId && isDynamicPrivateRoom(oldState.channel);
-    const isNewDynamic = newChannelId && isDynamicPrivateRoom(newState.channel);
+    const isOldDynamic = Boolean(oldChannelId && isDynamicPrivateRoom(oldChannelId));
+    const isNewDynamic = Boolean(newChannelId && isDynamicPrivateRoom(newChannelId));
 
     const member = newState.member || oldState.member;
     if (!member || member.user.bot) return;
@@ -1536,12 +1540,8 @@ async function handleManagedVoiceStateUpdate(oldState, newState) {
 
         if (isOldDynamic && remainingMembers.size === 0) {
           scheduleDynamicPrivateRoomDeletion(channel);
-            roomData.deleteScheduledAt = null;
         } else if (remainingMembers.size === 0) {
-          if (roomData) {
-            roomData.deleteAttempts = 0;
-            await setVoiceChannelStatus(channel, getActivePrivateRoomStatus(roomData));
-          }
+          await resetManagedRoom(channel);
         } else if (room.ownerId === member.id) {
           const candidates = Array.from(remainingMembers.values());
           const randomNewOwner = candidates[Math.floor(Math.random() * candidates.length)];
@@ -1571,7 +1571,7 @@ async function handleManagedVoiceInteraction(interaction) {
     const channelId = parts.slice(3).join('_');
 
     const channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel || !channel.isVoiceBased()) {
+    if (!channel || typeof channel.isVoiceBased !== 'function' || !channel.isVoiceBased()) {
       await interaction.reply({ content: 'Nie odnaleziono powiązanego kanału głosowego.', flags: [MessageFlags.Ephemeral] });
       return true;
     }
