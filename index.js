@@ -2182,6 +2182,44 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    if (message.author.id === ADMIN_USER_ID) {
+      const trimmed = message.content.trim();
+      const lower = trimmed.toLowerCase();
+      if (lower.startsWith('!test50h') || lower.startsWith('!test100h')) {
+        await message.delete().catch(() => null);
+        const is100 = lower.startsWith('!test100h');
+        const arg = trimmed.replace(/^!test(?:50|100)h\s*/i, '').trim();
+
+        let targetMember = message.mentions.members?.first() || null;
+        if (!targetMember && arg && message.guild) {
+          const members = await message.guild.members.fetch({ query: arg, limit: 5 }).catch(() => null);
+          targetMember = members?.first() || null;
+        }
+        if (!targetMember) {
+          targetMember = message.member;
+        }
+
+        const displayName = targetMember?.displayName || arg || message.author.username;
+        const avatarUrl = targetMember?.displayAvatarURL({ dynamic: true }) || message.author.displayAvatarURL({ dynamic: true });
+        const testMs = (is100 ? 100 : 50) * 60 * 60 * 1000;
+
+        const embed = new EmbedBuilder()
+          .setColor(is100 ? '#9B59B6' : '#F39C12')
+          .setTitle(is100 ? '👑 100 GODZIN W TYM TYGODNIU!' : '🔥 50 GODZIN W TYM TYGODNIU!')
+          .setDescription(
+            is100
+              ? `**${displayName}** dobił(a) właśnie do **100 godzin** na kanałach głosowych w tym tygodniu!`
+              : `**${displayName}** właśnie przekroczył(a) **50 godzin** na kanałach głosowych w tym tygodniu!`
+          )
+          .setThumbnail(avatarUrl)
+          .setFooter({ text: `Czas w tym tygodniu: ${formatDuration(testMs)} • Ekipa Remontowa` })
+          .setTimestamp();
+
+        await message.channel.send({ embeds: [embed] }).catch(() => null);
+        return;
+      }
+    }
+
     const managedIds = getManagedVoiceChannelIds();
     if (managedIds.includes(message.channelId) || dynamicPrivateRooms.has(message.channelId)) {
       await message.delete().catch(() => null);
