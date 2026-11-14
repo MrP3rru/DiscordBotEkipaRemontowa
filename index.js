@@ -115,6 +115,9 @@ function formatDurationShort(ms) {
 
 // Etykieta okresu
 function getPeriodLabel(period) {
+  if (typeof period === 'string' && period.startsWith('year:')) {
+    return `📅 Rok ${period.slice(5)}`;
+  }
   switch (period) {
     case 'today': return '📅 Dzisiaj';
     case 'week': return '📆 Ten tydzień';
@@ -387,6 +390,33 @@ client.once(Events.ClientReady, async () => {
             { name: '📆 Ten tydzień', value: 'week' },
             { name: '🗓️ Ten miesiąc', value: 'month' }
           ]
+        },
+        {
+          name: 'strona',
+          type: ApplicationCommandOptionType.Integer,
+          description: 'Numer strony rankingu (np. 1, 2, 3...).',
+          required: false,
+          min_value: 1
+        }
+      ]
+    },
+    {
+      name: 'czasyz',
+      description: 'Pokazuje czasy spędzone na kanałach głosowych w wybranym roku (np. 2026).',
+      options: [
+        {
+          name: 'rok',
+          type: ApplicationCommandOptionType.Integer,
+          description: 'Rok, dla którego chcesz sprawdzić czasy (np. 2026).',
+          required: true,
+          min_value: 2020,
+          max_value: 2100
+        },
+        {
+          name: 'uzytkownik',
+          type: ApplicationCommandOptionType.User,
+          description: 'Użytkownik, którego wynik z danego roku chcesz sprawdzić (opcjonalnie).',
+          required: false
         },
         {
           name: 'strona',
@@ -2344,6 +2374,38 @@ client.on('interactionCreate', async (interaction) => {
 
       const period = options.getString('okres') || 'all';
       const page = options.getInteger('strona') || 1;
+
+      const view = await buildLeaderboardView(guildId, period, page);
+      return await interaction.editReply(view);
+    }
+
+    // --- KOMENDA /czasyz ---
+    if (commandName === 'czasyz') {
+      await interaction.deferReply();
+
+      const year = options.getInteger('rok', true);
+      const targetUser = options.getUser('uzytkownik');
+      const page = options.getInteger('strona') || 1;
+      const period = `year:${year}`;
+
+      if (targetUser) {
+        const totalMs = await db.getUserPeriodTime(targetUser.id, guildId, period);
+        const rank = totalMs > 0 ? await db.getUserRank(targetUser.id, guildId, period) : null;
+
+        const embed = new EmbedBuilder()
+          .setColor('#5865F2')
+          .setTitle(`📅 Czas na kanałach głosowych — Rok ${year}`)
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `👤 **Użytkownik:** ${targetUser}\n` +
+            `⏱️ **Łączny czas w ${year}:** **${formatDuration(totalMs)}**\n` +
+            `🏅 **Miejsce w rankingu (${year}):** ${rank ? `#${rank}` : 'Brak w rankingu'}`
+          )
+          .setFooter({ text: 'Ekipa Remontowa • Archiwum roczne' })
+          .setTimestamp();
+
+        return await interaction.editReply({ embeds: [embed] });
+      }
 
       const view = await buildLeaderboardView(guildId, period, page);
       return await interaction.editReply(view);

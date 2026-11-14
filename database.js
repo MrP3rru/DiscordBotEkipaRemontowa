@@ -67,6 +67,20 @@ function getCurrentMonthRange() {
 }
 
 /**
+ * Parsuje okres roczny w formacie "year:YYYY" i zwraca zakres dat.
+ */
+function parseYearPeriod(period) {
+  if (typeof period !== 'string' || !period.startsWith('year:')) return null;
+  const year = Number(period.slice(5));
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) return null;
+  return {
+    year,
+    startDate: `${year}-01-01`,
+    endDate: `${year}-12-31`
+  };
+}
+
+/**
  * Dzieli sesję głosową na poszczególne dni, jeśli sesja przekroczyła północ.
  */
 function splitSessionByDays(startMs, endMs) {
@@ -494,7 +508,7 @@ async function getActiveSession(userId, guildId) {
  */
 function getActiveSessionBreakdown(activeSession) {
   if (!activeSession) {
-    return { today: 0, week: 0, month: 0, total: 0 };
+    return { today: 0, week: 0, month: 0, total: 0, byYear: {} };
   }
 
   const now = Date.now();
@@ -507,6 +521,7 @@ function getActiveSessionBreakdown(activeSession) {
   let week = 0;
   let month = 0;
   let total = now - activeSession.join_time;
+  const byYear = {};
 
   for (const chunk of chunks) {
     if (chunk.date === todayStr) {
@@ -518,9 +533,11 @@ function getActiveSessionBreakdown(activeSession) {
     if (chunk.date >= monthRange.startDate && chunk.date <= monthRange.endDate) {
       month += chunk.duration;
     }
+    const chunkYear = chunk.date.slice(0, 4);
+    byYear[chunkYear] = (byYear[chunkYear] || 0) + chunk.duration;
   }
 
-  return { today, week, month, total };
+  return { today, week, month, total, byYear };
 }
 
 /**
@@ -575,11 +592,19 @@ async function getUserPeriodTime(userId, guildId, period = 'all') {
     const todayStr = getWarsawDateString();
     const weekRange = getCurrentWeekRange();
     const monthRange = getCurrentMonthRange();
+    const yearInfo = parseYearPeriod(period);
 
     let queryTime = 0;
 
     if (isPostgres && pgPool) {
-      if (period === 'today') {
+      if (yearInfo) {
+        const res = await queryPg(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date >= $3 AND date <= $4',
+          [userId, guildId, yearInfo.startDate, yearInfo.endDate]
+        );
+        queryTime = Number(res.rows[0]?.period_time || 0);
+        return queryTime + (activeBreakdown.byYear[String(yearInfo.year)] || 0);
+      } else if (period === 'today') {
         const res = await queryPg(
           'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = $1 AND guild_id = $2 AND date = $3',
           [userId, guildId, todayStr]
@@ -602,7 +627,14 @@ async function getUserPeriodTime(userId, guildId, period = 'all') {
         return queryTime + activeBreakdown.month;
       }
     } else if (dbSQLite) {
-      if (period === 'today') {
+      if (yearInfo) {
+        const row = await dbSQLite.get(
+          'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date >= ? AND date <= ?',
+          [userId, guildId, yearInfo.startDate, yearInfo.endDate]
+        );
+        queryTime = Number(row?.period_time || 0);
+        return queryTime + (activeBreakdown.byYear[String(yearInfo.year)] || 0);
+      } else if (period === 'today') {
         const row = await dbSQLite.get(
           'SELECT SUM(time_spent) as period_time FROM user_daily_times WHERE user_id = ? AND guild_id = ? AND date = ?',
           [userId, guildId, todayStr]
@@ -736,6 +768,7 @@ async function getAllUsersSorted(guildId, period = 'all') {
   const todayStr = getWarsawDateString();
   const weekRange = getCurrentWeekRange();
   const monthRange = getCurrentMonthRange();
+  const yearInfo = parseYearPeriod(period);
 
   let map = new Map();
 
@@ -748,7 +781,10 @@ async function getAllUsersSorted(guildId, period = 'all') {
     } else {
       let dateFilter = 'date = $2';
       let params = [guildId, todayStr];
-      if (period === 'week') {
+      if (yearInfo) {
+        dateFilter = 'date >= $2 AND date <= $3';
+        params = [guildId, yearInfo.startDate, yearInfo.endDate];
+      } else if (period === 'week') {
         dateFilter = 'date >= $2 AND date <= $3';
         params = [guildId, weekRange.startDate, weekRange.endDate];
       } else if (period === 'month') {
@@ -772,7 +808,10 @@ async function getAllUsersSorted(guildId, period = 'all') {
     } else {
       let dateFilter = 'date = ?';
       let params = [guildId, todayStr];
-      if (period === 'week') {
+      if (yearInfo) {
+        dateFilter = 'date >= ? AND date <= ?';
+        params = [guildId, yearInfo.startDate, yearInfo.endDate];
+      } else if (period === 'week') {
         dateFilter = 'date >= ? AND date <= ?';
         params = [guildId, weekRange.startDate, weekRange.endDate];
       } else if (period === 'month') {
@@ -806,6 +845,7 @@ async function getAllUsersSorted(guildId, period = 'all') {
     const breakdown = getActiveSessionBreakdown({ join_time: Number(s.join_time) });
     let additional = 0;
     if (period === 'all') additional = breakdown.total;
+    else if (yearInfo) additional = breakdown.byYear[String(yearInfo.year)] || 0;
     else if (period === 'today') additional = breakdown.today;
     else if (period === 'week') additional = breakdown.week;
     else if (period === 'month') additional = breakdown.month;
