@@ -2176,6 +2176,20 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    if (message.content.trim().toLowerCase() === '!ping') {
+      const sent = await message.reply('🏓 Sprawdzanie pingu...').catch(() => null);
+      if (sent) {
+        const botLatency = sent.createdTimestamp - message.createdTimestamp;
+        const apiPing = Math.round(client.ws.ping);
+        await sent.edit(
+          `🏓 **Pong!** Bot działa poprawnie ✅\n` +
+          `• **Ping bota:** \`${botLatency} ms\`\n` +
+          `• **Ping serwera Discord (API):** \`${apiPing} ms\``
+        ).catch(() => null);
+      }
+      return;
+    }
+
     if (message.author.id === ADMIN_USER_ID && message.content.trim().toLowerCase() === '!adminlog') {
       await message.delete().catch(() => null);
       await sendAdminLogs(message.channel);
