@@ -1110,6 +1110,32 @@ async function ensurePrivateRoomCounterAtLeast(number) {
   }
 }
 
+async function hasWeeklyMilestone(userId, guildId, weekStartDate, milestoneHours) {
+  const key = `weekly_milestone:${guildId}:${weekStartDate}:${milestoneHours}:${userId}`;
+  return (await getBotStat(key)) > 0;
+}
+
+async function markWeeklyMilestone(userId, guildId, weekStartDate, milestoneHours) {
+  const key = `weekly_milestone:${guildId}:${weekStartDate}:${milestoneHours}:${userId}`;
+  await incrementBotStat(key, 1);
+}
+
+async function getActiveSessionUserIds(guildId) {
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg('SELECT user_id FROM active_sessions WHERE guild_id = $1', [guildId]);
+      return res.rows.map(r => r.user_id);
+    }
+    if (dbSQLite) {
+      const rows = await dbSQLite.all('SELECT user_id FROM active_sessions WHERE guild_id = ?', [guildId]);
+      return rows.map(r => r.user_id);
+    }
+  } catch (error) {
+    console.error('Błąd pobierania aktywnych użytkowników:', error.message);
+  }
+  return [];
+}
+
 module.exports = {
   initDatabase,
   startVoiceSession,
@@ -1129,6 +1155,9 @@ module.exports = {
   getBotStat,
   getNextPrivateRoomNumber,
   ensurePrivateRoomCounterAtLeast,
+  hasWeeklyMilestone,
+  markWeeklyMilestone,
+  getActiveSessionUserIds,
   getWarsawDateString,
   getCurrentWeekRange,
   getCurrentMonthRange

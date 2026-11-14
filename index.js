@@ -32,8 +32,66 @@ process.on('uncaughtException', (error) => {
 
 // --- GLOBALNE ZMIENNE STANU BOTA ---
 const activeClearChannels = new Set();
-let isAutoCleanEnabled = true;
+let isAutoCleanEnabled = false;
 let presenceRotationIndex = 0;
+const WEEKLY_MILESTONE_CHANNEL_ID = process.env.WEEKLY_MILESTONE_CHANNEL_ID || '680520293734809615';
+
+async function checkAndNotifyWeeklyMilestones(userId, guildId) {
+  try {
+    if (!guildId || !userId || !WEEKLY_MILESTONE_CHANNEL_ID) return;
+
+    const weeklyMs = await db.getUserPeriodTime(userId, guildId, 'week');
+    const weeklyHours = weeklyMs / (1000 * 60 * 60);
+    if (weeklyHours < 50) return;
+
+    const { startDate } = db.getCurrentWeekRange();
+    const milestones = [
+      {
+        hours: 100,
+        color: '#9B59B6',
+        title: '👑 100 GODZIN W TYM TYGODNIU!',
+        buildDescription: (name) => `**${name}** dobił(a) właśnie do **100 godzin** na kanałach głosowych w tym tygodniu!`
+      },
+      {
+        hours: 50,
+        color: '#F39C12',
+        title: '🔥 50 GODZIN W TYM TYGODNIU!',
+        buildDescription: (name) => `**${name}** właśnie przekroczył(a) **50 godzin** na kanałach głosowych w tym tygodniu!`
+      }
+    ];
+
+    const channel = await client.channels.fetch(WEEKLY_MILESTONE_CHANNEL_ID).catch(() => null);
+    if (!channel || !channel.isTextBased()) return;
+
+    const guild = channel.guild;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    const displayName = member?.displayName || member?.user?.username || `Użytkownik ${userId}`;
+    const avatarUrl = member?.displayAvatarURL({ dynamic: true }) || null;
+
+    for (const milestone of milestones) {
+      if (weeklyHours < milestone.hours) continue;
+      const alreadySent = await db.hasWeeklyMilestone(userId, guildId, startDate, milestone.hours);
+      if (alreadySent) continue;
+
+      await db.markWeeklyMilestone(userId, guildId, startDate, milestone.hours);
+
+      const embed = new EmbedBuilder()
+        .setColor(milestone.color)
+        .setTitle(milestone.title)
+        .setDescription(milestone.buildDescription(displayName))
+        .setFooter({ text: `Czas w tym tygodniu: ${formatDuration(weeklyMs)} • Ekipa Remontowa` })
+        .setTimestamp();
+
+      if (avatarUrl) {
+        embed.setThumbnail(avatarUrl);
+      }
+
+      await channel.send({ embeds: [embed] }).catch(() => null);
+    }
+  } catch (err) {
+    console.error('[Milestones] Błąd sprawdzania progów tygodniowych:', err.message);
+  }
+}
 
 // --- SERWER EXPRESS (Utrzymanie aktywności na Render) ---
 const app = express();
@@ -503,7 +561,16 @@ client.once(Events.ClientReady, async () => {
   updateApplicationBio();
   setInterval(updatePresence, 300000); // rotacja statusu co 5 minut
   setInterval(updateApplicationBio, 300000); // co 5 minut (bezpiecznie przed rate limitem)
-  setInterval(db.checkpointActiveSessions, 300000); // co 5 minut zapisywanie sesji w tle
+  setInterval(async () => {
+    await db.checkpointActiveSessions();
+    const guildId = process.env.GUILD_ID;
+    if (guildId) {
+      const activeUserIds = await db.getActiveSessionUserIds(guildId);
+      for (const uid of activeUserIds) {
+        await checkAndNotifyWeeklyMilestones(uid, guildId);
+      }
+    }
+  }, 300000); // co 5 minut zapisywanie sesji i sprawdzanie progów 50h/100h w tle
 
   // Uruchomienie pętli automatycznego usuwania wiadomości
   startAutoCleanLoop();
@@ -2041,9 +2108,11 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
     } else if (leftChannel) {
       await db.endVoiceSession(userId, guildId).catch(() => null);
+      await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
       console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
     } else if (switchedChannel) {
       await db.endVoiceSession(userId, guildId).catch(() => null);
+      await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
       await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
       console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
     }
