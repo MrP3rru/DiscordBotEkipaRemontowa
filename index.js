@@ -618,7 +618,7 @@ function getRecentAdminLogs() {
   const cutoff = Date.now() - 6 * 60 * 60 * 1000;
   return adminLogEntries
     .filter(entry => entry.timestamp >= cutoff)
-    .map(entry => `[${new Date(entry.timestamp).toLocaleString('pl-PL')}] ${entry.message}`);
+    .map(entry => `[${new Date(entry.timestamp).toLocaleString('pl-PL', { timeZone: 'Europe/Warsaw' })}] ${entry.message}`);
 }
 
 function splitDiscordMessage(text, maxLength = 1900) {
