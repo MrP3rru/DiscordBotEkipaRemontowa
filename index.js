@@ -494,8 +494,8 @@ const adminLogEntries = [];
 const PRIVATE_ROOM_ENTRY_CHANNEL_ID = '1543629049212182588';
 const PRIVATE_ROOM_CATEGORY_ID = '1543639402335436890';
 const ADMIN_USER_ID = '248464260991156225';
-const PRIVATE_ROOM_ENTRY_NAME = '🚪・STWÓRZ SWÓJ POKÓJ';
-const PRIVATE_ROOM_ENTRY_STATUS = '🟢 Wejdź, aby utworzyć prywatny kanał';
+const PRIVATE_ROOM_ENTRY_NAME = '➕ ● Stwórz swój pokój';
+const PRIVATE_ROOM_ENTRY_STATUS = '🔑 Wejdź, aby utworzyć prywatny kanał';
 const PRIVATE_ROOM_ENTRY_STATUS_DELAY_MS = 60 * 1000;
 const DYNAMIC_ROOM_NAME_PREFIX = '🔒 Pokój - ';
 const PRIVATE_ROOM_DELETE_DELAY_MS = 3 * 60 * 1000;
@@ -571,8 +571,8 @@ function formatWarsawTime(timestamp) {
 
 function getActivePrivateRoomStatus(roomData) {
   return roomData?.roomNumber
-    ? `🟢 ID:${formatPrivateRoomNumber(roomData.roomNumber)} • Prywatny pokój`
-    : '🟢 Prywatny pokój';
+    ? `🔊 ID:${formatPrivateRoomNumber(roomData.roomNumber)} • Prywatny pokój`
+    : '🔊 Prywatny pokój';
 }
 
 async function applyPrivateRoomIdentity(channel, member, roomData) {
@@ -592,7 +592,7 @@ async function applyPrivateRoomIdentity(channel, member, roomData) {
     }
   }
 
-  await setVoiceChannelStatus(channel, `🟢 ${numberLabel} • Prywatny pokój`);
+  await setVoiceChannelStatus(channel, `🔊 ${numberLabel} • Prywatny pokój`);
 }
 
 function scheduleEntryChannelStatusRestore(channel) {
@@ -744,7 +744,7 @@ function scheduleDynamicPrivateRoomDeletion(channel, delayMs = PRIVATE_ROOM_DELE
   if (!hadDeleteTimer) {
     setVoiceChannelStatus(
       channel,
-      `🟡 Pusty • zostanie usunięty o ${formatWarsawTime(roomData.deleteScheduledAt)}`
+      `⏳ Pusty • usunięcie o ${formatWarsawTime(roomData.deleteScheduledAt)}`
     );
   }
 
