@@ -35,6 +35,7 @@ const activeClearChannels = new Set();
 let isAutoCleanEnabled = false;
 let presenceRotationIndex = 0;
 const WEEKLY_MILESTONE_CHANNEL_ID = process.env.WEEKLY_MILESTONE_CHANNEL_ID || '680520293734809615';
+const AFK_CHANNEL_ID = process.env.AFK_CHANNEL_ID || '1459220291854274621';
 
 async function checkAndNotifyWeeklyMilestones(userId, guildId) {
   try {
@@ -482,6 +483,18 @@ client.once(Events.ClientReady, async () => {
           description: 'Numer strony rankingu (np. 1, 2, 3...).',
           required: false,
           min_value: 1
+        }
+      ]
+    },
+    {
+      name: 'afkczasy',
+      description: 'Pokazuje czas spędzony na kanale AFK (łącznie lub dla wybranej osoby).',
+      options: [
+        {
+          name: 'osoba',
+          type: ApplicationCommandOptionType.User,
+          description: 'Osoba, której czas AFK chcesz sprawdzić (opcjonalnie).',
+          required: false
         }
       ]
     },
@@ -2103,18 +2116,41 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     const leftChannel = oldState.channelId && !newState.channelId;
     const switchedChannel = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
 
+    const oldIsAfk = oldState.channelId === AFK_CHANNEL_ID;
+    const newIsAfk = newState.channelId === AFK_CHANNEL_ID;
+
     if (joinedChannel) {
-      await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
-      console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
+      if (newIsAfk) {
+        await db.startAfkSession(userId, guildId).catch(() => null);
+        console.log(`[AFK] ${member.user.tag} dołączył do kanału AFK.`);
+      } else {
+        await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
+        console.log(`[Voice] ${member.user.tag} dołączył do kanału głosowego #${newState.channel?.name || newState.channelId}.`);
+      }
     } else if (leftChannel) {
-      await db.endVoiceSession(userId, guildId).catch(() => null);
-      await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
-      console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
+      if (oldIsAfk) {
+        await db.endAfkSession(userId, guildId).catch(() => null);
+        console.log(`[AFK] ${member.user.tag} opuścił kanał AFK.`);
+      } else {
+        await db.endVoiceSession(userId, guildId).catch(() => null);
+        await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
+        console.log(`[Voice] ${member.user.tag} opuścił kanał głosowy.`);
+      }
     } else if (switchedChannel) {
-      await db.endVoiceSession(userId, guildId).catch(() => null);
-      await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
-      await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
-      console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
+      if (oldIsAfk) {
+        await db.endAfkSession(userId, guildId).catch(() => null);
+      } else {
+        await db.endVoiceSession(userId, guildId).catch(() => null);
+        await checkAndNotifyWeeklyMilestones(userId, guildId).catch(() => null);
+      }
+
+      if (newIsAfk) {
+        await db.startAfkSession(userId, guildId).catch(() => null);
+        console.log(`[AFK] ${member.user.tag} został przeniesiony na kanał AFK.`);
+      } else {
+        await db.startVoiceSession(userId, guildId, newState.channelId).catch(() => null);
+        console.log(`[Voice] ${member.user.tag} zmienił kanał na #${newState.channel?.name || newState.channelId}.`);
+      }
     }
   } catch (err) {
     console.error('Błąd w rejestracji czasu głosu:', err.message);
@@ -2500,6 +2536,46 @@ client.on('interactionCreate', async (interaction) => {
       return await interaction.editReply(view);
     }
 
+    // --- KOMENDA /afkczasy ---
+    if (commandName === 'afkczasy') {
+      await interaction.deferReply();
+
+      const targetUser = options.getUser('osoba');
+      if (targetUser) {
+        const afkMs = await db.getUserAfkTime(targetUser.id, guildId);
+        const embed = new EmbedBuilder()
+          .setColor('#95A5A6')
+          .setTitle('💤 Czas spędzony na kanale AFK')
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `👤 **Użytkownik:** ${targetUser}\n` +
+            `⏱️ **Łączny czas AFK:** **${formatDuration(afkMs)}**`
+          )
+          .setFooter({ text: 'Ekipa Remontowa • Statystyki AFK' })
+          .setTimestamp();
+
+        return await interaction.editReply({ embeds: [embed] });
+      }
+
+      const topAfk = await db.getAfkLeaderboard(guildId, 10);
+      const embed = new EmbedBuilder()
+        .setColor('#95A5A6')
+        .setTitle('💤 Ranking czasu na kanale AFK (TOP 10)')
+        .setDescription(
+          topAfk.length === 0
+            ? '*Nikt jeszcze nie ma zapisanego czasu na kanale AFK.*'
+            : topAfk.map((row, index) => {
+                const rank = index + 1;
+                const badge = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `**#${rank}**`;
+                return `${badge} <@${row.user_id}> — **${formatDuration(row.total_time)}**`;
+              }).join('\n\n')
+        )
+        .setFooter({ text: 'Ekipa Remontowa • Statystyki AFK' })
+        .setTimestamp();
+
+      return await interaction.editReply({ embeds: [embed] });
+    }
+
     // --- KOMENDA /czasyz ---
     if (commandName === 'czasyz') {
       await interaction.deferReply();
@@ -2530,6 +2606,46 @@ client.on('interactionCreate', async (interaction) => {
 
       const view = await buildLeaderboardView(guildId, period, page);
       return await interaction.editReply(view);
+    }
+
+    // --- KOMENDA /afkczasy ---
+    if (commandName === 'afkczasy') {
+      await interaction.deferReply();
+
+      const targetUser = options.getUser('osoba');
+      if (targetUser) {
+        const afkMs = await db.getUserAfkTime(targetUser.id, guildId);
+        const embed = new EmbedBuilder()
+          .setColor('#95A5A6')
+          .setTitle('💤 Czas spędzony na kanale AFK')
+          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+          .setDescription(
+            `👤 **Użytkownik:** ${targetUser}\n` +
+            `⏱️ **Łączny czas AFK:** **${formatDuration(afkMs)}**`
+          )
+          .setFooter({ text: 'Ekipa Remontowa • Statystyki AFK' })
+          .setTimestamp();
+
+        return await interaction.editReply({ embeds: [embed] });
+      }
+
+      const topAfk = await db.getAfkLeaderboard(guildId, 10);
+      const embed = new EmbedBuilder()
+        .setColor('#95A5A6')
+        .setTitle('💤 Ranking czasu na kanale AFK (TOP 10)')
+        .setDescription(
+          topAfk.length === 0
+            ? '*Nikt jeszcze nie ma zapisanego czasu na kanale AFK.*'
+            : topAfk.map((row, index) => {
+                const rank = index + 1;
+                const badge = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `**#${rank}**`;
+                return `${badge} <@${row.user_id}> — **${formatDuration(row.total_time)}**`;
+              }).join('\n\n')
+        )
+        .setFooter({ text: 'Ekipa Remontowa • Statystyki AFK' })
+        .setTimestamp();
+
+      return await interaction.editReply({ embeds: [embed] });
     }
 
     // --- POMOCNICZE METODY DO CZYSZENIA WIADOMOŚCI ---

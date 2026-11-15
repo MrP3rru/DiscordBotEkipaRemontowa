@@ -201,6 +201,24 @@ async function initDatabase() {
       )
     `);
 
+    await dbSQLite.exec(`
+      CREATE TABLE IF NOT EXISTS afk_sessions (
+        user_id TEXT,
+        guild_id TEXT,
+        join_time INTEGER,
+        PRIMARY KEY (user_id, guild_id)
+      )
+    `);
+
+    await dbSQLite.exec(`
+      CREATE TABLE IF NOT EXISTS user_afk_times (
+        user_id TEXT,
+        guild_id TEXT,
+        total_time INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, guild_id)
+      )
+    `);
+
     await dbSQLite.run(
       `INSERT INTO system_stats (stat_name, stat_value)
        SELECT 'bot_actions', COALESCE((SELECT stat_value FROM system_stats WHERE stat_name = 'deleted_messages'), 0)
@@ -267,6 +285,24 @@ async function initDatabase() {
         CREATE TABLE IF NOT EXISTS system_stats (
           stat_name VARCHAR(50) PRIMARY KEY,
           stat_value BIGINT DEFAULT 0
+        )
+      `);
+
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS afk_sessions (
+          user_id VARCHAR(30),
+          guild_id VARCHAR(30),
+          join_time BIGINT,
+          PRIMARY KEY (user_id, guild_id)
+        )
+      `);
+
+      await queryPg(`
+        CREATE TABLE IF NOT EXISTS user_afk_times (
+          user_id VARCHAR(30),
+          guild_id VARCHAR(30),
+          total_time BIGINT DEFAULT 0,
+          PRIMARY KEY (user_id, guild_id)
         )
       `);
 
@@ -1136,6 +1172,161 @@ async function getActiveSessionUserIds(guildId) {
   return [];
 }
 
+async function startAfkSession(userId, guildId) {
+  const now = Date.now();
+  try {
+    if (isPostgres && pgPool) {
+      await queryPg(
+        `INSERT INTO afk_sessions (user_id, guild_id, join_time)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, guild_id) DO NOTHING`,
+        [userId, guildId, now]
+      );
+    } else if (dbSQLite) {
+      await dbSQLite.run(
+        'INSERT OR IGNORE INTO afk_sessions (user_id, guild_id, join_time) VALUES (?, ?, ?)',
+        [userId, guildId, now]
+      );
+    }
+  } catch (error) {
+    console.error(`Błąd startAfkSession dla ${userId}:`, error.message);
+  }
+}
+
+async function endAfkSession(userId, guildId) {
+  const now = Date.now();
+  try {
+    if (isPostgres && pgPool) {
+      const res = await queryPg(
+        'DELETE FROM afk_sessions WHERE user_id = $1 AND guild_id = $2 RETURNING join_time',
+        [userId, guildId]
+      );
+      if (res.rows.length > 0) {
+        const duration = Math.max(0, now - Number(res.rows[0].join_time));
+        if (duration > 0) {
+          await queryPg(
+            `INSERT INTO user_afk_times (user_id, guild_id, total_time)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, guild_id)
+             DO UPDATE SET total_time = user_afk_times.total_time + EXCLUDED.total_time`,
+            [userId, guildId, duration]
+          );
+        }
+      }
+    } else if (dbSQLite) {
+      const row = await dbSQLite.get(
+        'SELECT join_time FROM afk_sessions WHERE user_id = ? AND guild_id = ?',
+        [userId, guildId]
+      );
+      if (row) {
+        await dbSQLite.run('DELETE FROM afk_sessions WHERE user_id = ? AND guild_id = ?', [userId, guildId]);
+        const duration = Math.max(0, now - Number(row.join_time));
+        if (duration > 0) {
+          await dbSQLite.run(
+            `INSERT INTO user_afk_times (user_id, guild_id, total_time)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, guild_id)
+             DO UPDATE SET total_time = total_time + excluded.total_time`,
+            [userId, guildId, duration]
+          );
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`Błąd endAfkSession dla ${userId}:`, error.message);
+  }
+}
+
+async function getUserAfkTime(userId, guildId) {
+  try {
+    let saved = 0;
+    let active = 0;
+    const now = Date.now();
+
+    if (isPostgres && pgPool) {
+      const res = await queryPg(
+        'SELECT total_time FROM user_afk_times WHERE user_id = $1 AND guild_id = $2',
+        [userId, guildId]
+      );
+      saved = Number(res.rows[0]?.total_time || 0);
+
+      const sess = await queryPg(
+        'SELECT join_time FROM afk_sessions WHERE user_id = $1 AND guild_id = $2',
+        [userId, guildId]
+      );
+      if (sess.rows.length > 0) {
+        active = Math.max(0, now - Number(sess.rows[0].join_time));
+      }
+    } else if (dbSQLite) {
+      const row = await dbSQLite.get(
+        'SELECT total_time FROM user_afk_times WHERE user_id = ? AND guild_id = ?',
+        [userId, guildId]
+      );
+      saved = Number(row?.total_time || 0);
+
+      const sess = await dbSQLite.get(
+        'SELECT join_time FROM afk_sessions WHERE user_id = ? AND guild_id = ?',
+        [userId, guildId]
+      );
+      if (sess) {
+        active = Math.max(0, now - Number(sess.join_time));
+      }
+    }
+    return saved + active;
+  } catch (error) {
+    console.error(`Błąd getUserAfkTime dla ${userId}:`, error.message);
+    return 0;
+  }
+}
+
+async function getAfkLeaderboard(guildId, limit = 10) {
+  try {
+    const map = new Map();
+    const now = Date.now();
+
+    if (isPostgres && pgPool) {
+      const res = await queryPg(
+        'SELECT user_id, total_time FROM user_afk_times WHERE guild_id = $1',
+        [guildId]
+      );
+      for (const r of res.rows) map.set(r.user_id, Number(r.total_time));
+
+      const sess = await queryPg(
+        'SELECT user_id, join_time FROM afk_sessions WHERE guild_id = $1',
+        [guildId]
+      );
+      for (const s of sess.rows) {
+        const extra = Math.max(0, now - Number(s.join_time));
+        map.set(s.user_id, (map.get(s.user_id) || 0) + extra);
+      }
+    } else if (dbSQLite) {
+      const rows = await dbSQLite.all(
+        'SELECT user_id, total_time FROM user_afk_times WHERE guild_id = ?',
+        [guildId]
+      );
+      for (const r of rows) map.set(r.user_id, Number(r.total_time));
+
+      const sess = await dbSQLite.all(
+        'SELECT user_id, join_time FROM afk_sessions WHERE guild_id = ?',
+        [guildId]
+      );
+      for (const s of sess) {
+        const extra = Math.max(0, now - Number(s.join_time));
+        map.set(s.user_id, (map.get(s.user_id) || 0) + extra);
+      }
+    }
+
+    return Array.from(map.entries())
+      .filter(([, time]) => time > 0)
+      .map(([user_id, total_time]) => ({ user_id, total_time }))
+      .sort((a, b) => b.total_time - a.total_time)
+      .slice(0, limit);
+  } catch (error) {
+    console.error('Błąd getAfkLeaderboard:', error.message);
+    return [];
+  }
+}
+
 module.exports = {
   initDatabase,
   startVoiceSession,
@@ -1158,6 +1349,10 @@ module.exports = {
   hasWeeklyMilestone,
   markWeeklyMilestone,
   getActiveSessionUserIds,
+  startAfkSession,
+  endAfkSession,
+  getUserAfkTime,
+  getAfkLeaderboard,
   getWarsawDateString,
   getCurrentWeekRange,
   getCurrentMonthRange
